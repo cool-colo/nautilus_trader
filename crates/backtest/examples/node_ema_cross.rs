@@ -24,6 +24,8 @@
 //!
 //! Run with: `cargo run -p nautilus-backtest --features examples,streaming --example node-ema-cross`
 
+use std::num::NonZeroUsize;
+
 use nautilus_backtest::{
     config::{BacktestDataConfig, BacktestRunConfig, BacktestVenueConfig, NautilusDataType},
     node::BacktestNode,
@@ -45,7 +47,7 @@ const STARTING_BALANCE: &str = "1_000_000 USD";
 const TRADE_SIZE: &str = "100000";
 const EMA_FAST_PERIOD: usize = 10;
 const EMA_SLOW_PERIOD: usize = 20;
-const CHUNK_SIZE: usize = 100;
+const CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 const RUN_ID: &str = "ema-cross-run";
 
 fn generate_quotes(instrument_id: InstrumentId) -> Vec<QuoteTick> {
@@ -123,14 +125,14 @@ fn main() -> anyhow::Result<()> {
         .data_type(NautilusDataType::QuoteTick)
         .catalog_path(catalog_path)
         .instrument_id(instrument_id)
-        .build();
+        .build()?;
 
     let run_config = BacktestRunConfig::builder()
         .id(RUN_ID.to_string())
         .venues(vec![venue_config])
         .data(vec![data_config])
         .chunk_size(CHUNK_SIZE)
-        .build();
+        .build()?;
 
     // Build and run the backtest
     let mut node = BacktestNode::new(vec![run_config])?;

@@ -25,7 +25,7 @@
 //! Run with:
 //! `cargo run -p nautilus-backtest --features examples,streaming --example tardis-option-chain`
 
-use std::{fmt::Debug, path::Path, str::FromStr};
+use std::{fmt::Debug, num::NonZeroUsize, path::Path, str::FromStr};
 
 use nautilus_backtest::{
     config::{BacktestDataConfig, BacktestRunConfig, BacktestVenueConfig, NautilusDataType},
@@ -285,19 +285,19 @@ fn main() -> anyhow::Result<()> {
         .data_type(NautilusDataType::QuoteTick)
         .catalog_path(catalog_path.clone())
         .instrument_ids(instrument_ids.clone())
-        .build();
+        .build()?;
     let greeks_data = BacktestDataConfig::builder()
         .data_type(NautilusDataType::OptionGreeks)
         .catalog_path(catalog_path)
         .instrument_ids(instrument_ids)
-        .build();
+        .build()?;
 
     let run_config = BacktestRunConfig::builder()
         .id("tardis-option-chain".to_string())
         .venues(vec![venue_config])
         .data(vec![quote_data, greeks_data])
-        .chunk_size(10_000)
-        .build();
+        .chunk_size(NonZeroUsize::new(10_000).unwrap())
+        .build()?;
     let config_id = run_config.id().to_string();
 
     let mut node = BacktestNode::new(vec![run_config])?;
