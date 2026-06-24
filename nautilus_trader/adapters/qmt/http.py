@@ -50,7 +50,16 @@ class QMTHttpClient:
 
     async def connect(self) -> None:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self.timeout, headers=self.headers)
+            # Keep-alive connections are reused across requests, but bounded by
+            # keepalive_timeout so an idle connection is dropped before the upstream
+            # (or a dev tunnel edge) can leave it stale. The retry-once in _request
+            # covers the rare case where a still-pooled connection has gone bad.
+            connector = aiohttp.TCPConnector(keepalive_timeout=15.0, limit=10)
+            self._session = aiohttp.ClientSession(
+                timeout=self.timeout,
+                headers=self.headers,
+                connector=connector,
+            )
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
@@ -66,24 +75,55 @@ class QMTHttpClient:
     async def delete(self, path: str) -> Any:
         return await self._request("DELETE", path)
 
+    # HTTP statuses returned by the tunnel edge when it transiently cannot reach the
+    # upstream proxy. A retry with a fresh connection usually succeeds.
+    _TRANSIENT_STATUSES = (502, 503, 504)
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        await self.connect()
-        if self._session is None:
-            raise QMTProxyError("HTTP session is not initialized")
         url = f"{self.base_url}{path}"
-        async with self._session.request(method, url, **kwargs) as response:
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            await self.connect()
+            if self._session is None:
+                raise QMTProxyError("HTTP session is not initialized")
             try:
-                payload = await response.json()
-            except aiohttp.ContentTypeError as exc:
-                text = await response.text()
-                raise QMTProxyError(f"QMT proxy returned non-JSON response: {text}") from exc
-            if response.status >= 400:
-                raise QMTProxyError(f"QMT proxy HTTP {response.status}: {payload}")
-            if isinstance(payload, dict) and not payload.get("success", True):
-                raise QMTProxyError(str(payload.get("message") or payload))
-            if isinstance(payload, dict) and "data" in payload:
-                return payload["data"]
-            return payload
+                async with self._session.request(method, url, **kwargs) as response:
+                    if response.status in self._TRANSIENT_STATUSES and attempt == 0:
+                        body = await response.text()
+                        last_exc = QMTProxyError(
+                            f"QMT proxy HTTP {response.status} "
+                            f"(content_type={response.content_type}): {body!r}",
+                        )
+                        await self.close()  # discard the connection and retry fresh
+                        continue
+                    if response.status >= 400:
+                        body = await response.text()
+                        raise QMTProxyError(
+                            f"QMT proxy HTTP {response.status} "
+                            f"(content_type={response.content_type}): {body!r}",
+                        )
+                    try:
+                        payload = await response.json()
+                    except aiohttp.ContentTypeError as exc:
+                        text = await response.text()
+                        raise QMTProxyError(
+                            f"QMT proxy returned non-JSON response "
+                            f"(status={response.status}, content_type={response.content_type}): {text!r}",
+                        ) from exc
+                    if isinstance(payload, dict) and not payload.get("success", True):
+                        raise QMTProxyError(str(payload.get("message") or payload))
+                    if isinstance(payload, dict) and "data" in payload:
+                        return payload["data"]
+                    return payload
+            except (aiohttp.ClientConnectionError, aiohttp.ServerDisconnectedError) as exc:
+                last_exc = exc
+                await self.close()
+                if attempt == 0:
+                    continue
+                raise QMTProxyError(f"QMT proxy connection error: {exc}") from exc
+
+        # Both attempts hit a transient status; surface the last error.
+        raise last_exc if last_exc is not None else QMTProxyError("QMT proxy request failed")
 
     @staticmethod
     def _normalize_query_params(params: dict[str, Any] | None) -> dict[str, str | int | float] | None:

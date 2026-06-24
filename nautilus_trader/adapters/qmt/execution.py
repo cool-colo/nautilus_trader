@@ -373,6 +373,9 @@ class QMTExecutionClient(LiveExecutionClient):
         return reports
 
     async def _poll_loop(self) -> None:
+        base_interval = self._config.poll_interval_secs
+        max_backoff = 30.0
+        failure_streak = 0
         while True:
             try:
                 await self._refresh_account_state()
@@ -384,8 +387,24 @@ class QMTExecutionClient(LiveExecutionClient):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._log.warning(f"QMT execution poll failed: {exc}")
-            await asyncio.sleep(self._config.poll_interval_secs)
+                failure_streak += 1
+                # Log the first failure of a streak and then every 30th, so a tunnel
+                # outage does not spam a warning on every poll interval.
+                if failure_streak == 1 or failure_streak % 30 == 0:
+                    self._log.warning(
+                        f"QMT execution poll failed (streak={failure_streak}): {exc}",
+                    )
+                # Exponential backoff capped at max_backoff while the proxy is unreachable.
+                backoff = min(base_interval * (2 ** min(failure_streak, 5)), max_backoff)
+                await asyncio.sleep(backoff)
+                continue
+
+            if failure_streak:
+                self._log.info(
+                    f"QMT execution poll recovered after {failure_streak} failure(s)",
+                )
+                failure_streak = 0
+            await asyncio.sleep(base_interval)
 
     async def _refresh_account_state(self) -> None:
         if self._session_id is None:
