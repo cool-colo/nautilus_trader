@@ -251,33 +251,78 @@ class QMTDataClient(LiveMarketDataClient):
         url = f"{self._ws_base_url}/ws/quote/{subscription_id}"
         if self._config.api_key:
             url = f"{url}?{urlencode({'token': self._config.api_key})}"
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(url) as ws:
-                async for message in ws:
-                    if message.type == aiohttp.WSMsgType.TEXT:
-                        payload = message.json()
-                        if payload.get("type") != "quote":
-                            continue
-                        event = payload.get("data") or {}
-                        data = event.get("data") or {}
-                        if event.get("payload_type") == "tick" and instrument_id is not None:
-                            tick = parse_quote_tick(
-                                instrument_id=instrument_id,
-                                payload=data,
-                                ts_init=self._clock.timestamp_ns(),
+
+        label = bar_type if bar_type is not None else instrument_id
+        backoff = 1.0
+        max_backoff = 30.0
+        failure_streak = 0
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url) as ws:
+                        if failure_streak:
+                            self._log.info(
+                                f"QMT quote stream reconnected for {label} "
+                                f"after {failure_streak} failure(s)",
                             )
-                            if tick is not None:
-                                self._handle_data(tick)
-                        elif event.get("payload_type") == "kline" and bar_type is not None:
-                            bar = parse_bar(
-                                bar_type=bar_type,
-                                payload=data,
-                                ts_init=self._clock.timestamp_ns(),
-                            )
-                            if bar is not None:
-                                self._handle_data(bar)
-                    elif message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
-                        break
+                            failure_streak = 0
+                            backoff = 1.0
+                        await self._consume_ws(ws, instrument_id=instrument_id, bar_type=bar_type)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failure_streak += 1
+                if failure_streak == 1 or failure_streak % 30 == 0:
+                    self._log.warning(
+                        f"QMT quote stream for {label} failed "
+                        f"(streak={failure_streak}): {exc}",
+                    )
+            else:
+                # ws_connect exited cleanly (server closed). Treat as a drop and reconnect.
+                failure_streak += 1
+                if failure_streak == 1:
+                    self._log.warning(f"QMT quote stream for {label} closed; reconnecting")
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    async def _consume_ws(
+        self,
+        ws,
+        instrument_id: InstrumentId | None = None,
+        bar_type=None,
+    ) -> None:
+        async for message in ws:
+            if message.type == aiohttp.WSMsgType.TEXT:
+                payload = message.json()
+                msg_type = payload.get("type")
+                if msg_type == "error":
+                    # e.g. "missing-subscription" if the proxy lost the subscription
+                    # (proxy restart). Surface it; the reconnect loop will keep retrying.
+                    self._log.warning(f"QMT quote stream error message: {payload.get('message')}")
+                    continue
+                if msg_type != "quote":
+                    continue
+                event = payload.get("data") or {}
+                data = event.get("data") or {}
+                if event.get("payload_type") == "tick" and instrument_id is not None:
+                    tick = parse_quote_tick(
+                        instrument_id=instrument_id,
+                        payload=data,
+                        ts_init=self._clock.timestamp_ns(),
+                    )
+                    if tick is not None:
+                        self._handle_data(tick)
+                elif event.get("payload_type") == "kline" and bar_type is not None:
+                    bar = parse_bar(
+                        bar_type=bar_type,
+                        payload=data,
+                        ts_init=self._clock.timestamp_ns(),
+                    )
+                    if bar is not None:
+                        self._handle_data(bar)
+            elif message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                break
 
     def _send_all_instruments_to_data_engine(self) -> None:
         for instrument in self._instrument_provider.get_all().values():
