@@ -112,6 +112,10 @@ class QMTExecutionClient(LiveExecutionClient):
         self._known_client_order_ids: dict[VenueOrderId, ClientOrderId] = {}
         self._seen_trade_ids: set[TradeId] = set()
         self._terminal_events: set[VenueOrderId] = set()
+        # Last published (cash, frozen_cash) so the 1s poll only generates a new
+        # account state — and the Portfolio INFO log — when the balance actually
+        # changes, instead of once per poll for a static balance.
+        self._last_account_key: tuple[Decimal, Decimal] | None = None
 
         self._set_account_id(AccountId(f"{client_id.value}-{config.account_id}"))
         self._log.info(f"{config.base_url_http=}", LogColor.BLUE)
@@ -127,7 +131,7 @@ class QMTExecutionClient(LiveExecutionClient):
             account_type=self._config.account_type,
         )
         self._session_id = session["session_id"]
-        await self._refresh_account_state()
+        await self._refresh_account_state(force=True)
         self._poll_task = self.create_task(self._poll_loop(), log_msg="qmt_execution_poll")
 
     async def _disconnect(self) -> None:
@@ -282,7 +286,7 @@ class QMTExecutionClient(LiveExecutionClient):
             await self._cancel_order(cancel)
 
     async def _query_account(self, command: QueryAccount) -> None:
-        await self._refresh_account_state()
+        await self._refresh_account_state(force=True)
 
     async def generate_order_status_report(
         self,
@@ -406,12 +410,20 @@ class QMTExecutionClient(LiveExecutionClient):
                 failure_streak = 0
             await asyncio.sleep(base_interval)
 
-    async def _refresh_account_state(self) -> None:
+    async def _refresh_account_state(self, force: bool = False) -> None:
         if self._session_id is None:
             return
         asset = await self._http_client.get_asset(self._session_id)
         cash = Decimal(str(asset.get("cash", "0") or "0"))
         frozen_cash = Decimal(str(asset.get("frozen_cash", "0") or "0"))
+        # The poll loop runs every poll_interval_secs and the balance is usually
+        # unchanged between polls; skip regenerating the account state (which the
+        # Portfolio logs at INFO) unless the balance moved or the caller forces a
+        # refresh (initial connect / explicit account query).
+        account_key = (cash, frozen_cash)
+        if not force and account_key == self._last_account_key:
+            return
+        self._last_account_key = account_key
         total_cash = cash + frozen_cash
         balance = AccountBalance(
             total=Money(total_cash, CNY),
