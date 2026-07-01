@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from nautilus_trader.adapters.qmt.common import instrument_id_to_qmt_symbol
@@ -27,16 +28,29 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId
 
 
+# "沪深京A股" is the QMT whole-market A-share sector (Shanghai + Shenzhen +
+# Beijing) — a single sector that enumerates every tradable A-share.
+DEFAULT_LOAD_ALL_SECTORS: frozenset[str] = frozenset({"沪深京A股"})
+
+# Max concurrent instrument-detail fetches during startup loading. Kept in step
+# with the HTTP client's connection pool so gather() saturates but never
+# overruns it.
+_LOAD_CONCURRENCY = 32
+
+
 class QMTInstrumentProviderConfig(InstrumentProviderConfig, frozen=True):
     """
     Configuration for ``QMTInstrumentProvider``.
 
-    ``quant-qmt-proxy`` does not expose an exchange-wide stock master endpoint, so
-    use ``load_ids`` or ``load_symbols`` for deterministic startup loading. If
-    ``load_all=True`` is set, ``load_symbols`` or ``filters["symbols"]`` is required.
+    For deterministic startup loading, use ``load_ids`` or ``load_symbols``. When
+    ``load_all=True`` and neither ``load_symbols`` nor ``filters["symbols"]`` is
+    given, the provider enumerates the exchange-wide stock master by aggregating
+    the symbols of ``load_all_sectors`` from ``quant-qmt-proxy``'s ``/sectors``
+    endpoint (default the whole-market A-share sectors).
     """
 
     load_symbols: frozenset[str] | None = None
+    load_all_sectors: frozenset[str] | None = None
     complete_details: bool = False
 
     def __eq__(self, other: object) -> bool:
@@ -47,6 +61,7 @@ class QMTInstrumentProviderConfig(InstrumentProviderConfig, frozen=True):
             and self.load_ids == other.load_ids
             and self.filters == other.filters
             and self.load_symbols == other.load_symbols
+            and self.load_all_sectors == other.load_all_sectors
             and self.complete_details == other.complete_details
         )
 
@@ -58,6 +73,7 @@ class QMTInstrumentProviderConfig(InstrumentProviderConfig, frozen=True):
                 self.load_ids,
                 filters,
                 self.load_symbols,
+                self.load_all_sectors,
                 self.complete_details,
             ),
         )
@@ -82,9 +98,12 @@ class QMTInstrumentProvider(InstrumentProvider):
     async def load_all_async(self, filters: dict | None = None) -> None:
         symbols = self._resolve_load_all_symbols(filters)
         if not symbols:
+            symbols = await self._resolve_sector_symbols()
+        if not symbols:
             self._log.warning(
-                "QMT cannot load all instruments without configured symbols; "
-                "set load_ids, load_symbols, or filters={'symbols': [...]}.",
+                "QMT cannot load all instruments: no explicit symbols configured and "
+                "the /sectors endpoint returned no symbols for the configured sectors. "
+                "Set load_ids, load_symbols, filters={'symbols': [...]}, or load_all_sectors.",
             )
             return
         await self._load_symbols(symbols)
@@ -110,12 +129,45 @@ class QMTInstrumentProvider(InstrumentProvider):
         raw_symbols: Any = filters.get("symbols") or self._config_qmt.load_symbols or []
         return [normalize_qmt_symbol(str(symbol)) for symbol in raw_symbols if str(symbol).strip()]
 
+    async def _resolve_sector_symbols(self) -> list[str]:
+        """
+        Enumerate the exchange-wide stock master from the proxy ``/sectors`` endpoint.
+
+        Aggregates and dedupes the symbols of the configured ``load_all_sectors``
+        (default the whole-market A-share sectors), preserving first-seen order.
+        """
+        wanted = self._config_qmt.load_all_sectors or DEFAULT_LOAD_ALL_SECTORS
+        try:
+            sectors = await self._client.get_sectors()
+        except Exception as exc:  # pragma: no cover - network/proxy failure path
+            self._log.warning(f"QMT failed to load sectors for load_all: {exc}")
+            return []
+        seen: set[str] = set()
+        symbols: list[str] = []
+        for sector in sectors:
+            if str(sector.get("sector_name", "")) not in wanted:
+                continue
+            for raw in sector.get("symbols", []) or []:
+                if not str(raw).strip():
+                    continue
+                symbol = normalize_qmt_symbol(str(raw))
+                if symbol not in seen:
+                    seen.add(symbol)
+                    symbols.append(symbol)
+        return symbols
+
     async def _load_symbols(self, symbols: list[str]) -> None:
-        for symbol in symbols:
-            detail = await self._client.get_instrument(
-                symbol,
-                complete=self._config_qmt.complete_details,
-            )
+        # Fetch instrument details concurrently. Loading the whole-market universe
+        # (thousands of names) serially would exceed the node's connection timeout,
+        # so bound concurrency to the HTTP connection pool and gather in parallel.
+        semaphore = asyncio.Semaphore(_LOAD_CONCURRENCY)
+
+        async def _load_one(symbol: str) -> None:
+            async with semaphore:
+                detail = await self._client.get_instrument(
+                    symbol,
+                    complete=self._config_qmt.complete_details,
+                )
             fields = detail.get("fields", detail)
             now = self._clock.timestamp_ns()
             instrument = parse_equity(
@@ -125,3 +177,19 @@ class QMTInstrumentProvider(InstrumentProvider):
                 ts_init=now,
             )
             self.add(instrument)
+
+        results = await asyncio.gather(
+            *(_load_one(symbol) for symbol in symbols),
+            return_exceptions=True,
+        )
+        failures = [
+            (symbol, result)
+            for symbol, result in zip(symbols, results)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            sample = ", ".join(f"{symbol}: {exc!r}" for symbol, exc in failures[:5])
+            self._log.warning(
+                f"QMT failed to load {len(failures)}/{len(symbols)} instrument details "
+                f"(showing up to 5): {sample}",
+            )

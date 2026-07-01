@@ -54,7 +54,7 @@ class QMTHttpClient:
             # keepalive_timeout so an idle connection is dropped before the upstream
             # (or a dev tunnel edge) can leave it stale. The retry-once in _request
             # covers the rare case where a still-pooled connection has gone bad.
-            connector = aiohttp.TCPConnector(keepalive_timeout=15.0, limit=10)
+            connector = aiohttp.TCPConnector(keepalive_timeout=15.0, limit=40)
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
                 headers=self.headers,
@@ -144,6 +144,10 @@ class QMTHttpClient:
 
     async def get_instrument(self, symbol: str, complete: bool = False) -> dict[str, Any]:
         return await self.get(f"/api/v1/data/instrument/{symbol}", params={"complete": complete})
+
+    async def get_sectors(self) -> list[dict[str, Any]]:
+        data = await self.get("/api/v1/data/sectors")
+        return list(data.get("items", []))
 
     async def get_kline_history(
         self,
