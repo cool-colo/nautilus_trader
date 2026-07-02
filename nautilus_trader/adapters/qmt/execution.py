@@ -16,8 +16,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+from datetime import timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from nautilus_trader.adapters.qmt.common import instrument_id_to_qmt_symbol
 from nautilus_trader.adapters.qmt.common import millis_to_nanos
@@ -50,6 +53,7 @@ from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
+from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
@@ -72,6 +76,82 @@ from nautilus_trader.model.objects import AccountBalance
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.orders import Order
+
+
+_QMT_CHINA_TZ = ZoneInfo("Asia/Shanghai")
+_QMT_OPEN_ORDER_STATUSES = {
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.PENDING_CANCEL,
+    OrderStatus.PENDING_UPDATE,
+    OrderStatus.SUBMITTED,
+}
+_QMT_STALE_DAY_ORDER_STATUSES = {
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.SUBMITTED,
+}
+
+
+def _coerce_utc_datetime(value: datetime | Any) -> datetime:
+    if hasattr(value, "to_pydatetime"):
+        value = value.to_pydatetime()
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
+def _qmt_order_status(raw_order: dict[str, Any], now: datetime | None = None) -> OrderStatus:
+    status = qmt_lifecycle_to_order_status(raw_order.get("lifecycle_status"))
+    if status not in _QMT_STALE_DAY_ORDER_STATUSES:
+        return status
+
+    order_time_ms = raw_order.get("order_time_ms")
+    if order_time_ms is None:
+        return status
+
+    try:
+        order_time_ms_int = int(order_time_ms)
+    except (TypeError, ValueError):
+        return status
+
+    if order_time_ms_int <= 0:
+        return status
+
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
+    now = _coerce_utc_datetime(now)
+
+    order_date = datetime.fromtimestamp(
+        order_time_ms_int / 1000,
+        tz=timezone.utc,
+    ).astimezone(_QMT_CHINA_TZ).date()
+    current_date = now.astimezone(_QMT_CHINA_TZ).date()
+
+    # QMT A-share orders are DAY orders. If the proxy still returns an open
+    # lifecycle for an older trading date, treat it as terminal so the live cache
+    # does not keep trying to cancel a venue order QMT no longer knows.
+    if order_date < current_date:
+        return OrderStatus.EXPIRED
+
+    return status
+
+
+def _is_prior_qmt_day(ts_ns: int, now: datetime | Any) -> bool:
+    if ts_ns <= 0:
+        return False
+
+    now = _coerce_utc_datetime(now)
+    ts_date = datetime.fromtimestamp(
+        ts_ns / 1_000_000_000,
+        tz=timezone.utc,
+    ).astimezone(_QMT_CHINA_TZ).date()
+    current_date = now.astimezone(_QMT_CHINA_TZ).date()
+
+    return ts_date < current_date
 
 
 class QMTExecutionClient(LiveExecutionClient):
@@ -318,19 +398,34 @@ class QMTExecutionClient(LiveExecutionClient):
             return []
         reports = []
         for raw_order in await self._http_client.get_orders(self._session_id, cancelable_only=False):
-            status = qmt_lifecycle_to_order_status(raw_order.get("lifecycle_status"))
-            if command.open_only and status not in {
-                OrderStatus.ACCEPTED,
-                OrderStatus.PARTIALLY_FILLED,
-                OrderStatus.PENDING_CANCEL,
-                OrderStatus.PENDING_UPDATE,
-                OrderStatus.SUBMITTED,
-            }:
+            status = _qmt_order_status(raw_order, now=self._clock.utc_now())
+            if command.open_only and status not in _QMT_OPEN_ORDER_STATUSES:
                 continue
             report = self._parse_order_status_report(raw_order)
             if report is not None and (command.instrument_id is None or report.instrument_id == command.instrument_id):
                 reports.append(report)
         return reports
+
+    async def generate_mass_status(
+        self,
+        lookback_mins: int | None = None,
+    ) -> ExecutionMassStatus | None:
+        mass_status = await super().generate_mass_status(lookback_mins=lookback_mins)
+        if mass_status is None:
+            return None
+        if self._session_id is None:
+            return mass_status
+
+        stale_reports = self._stale_cached_open_order_reports(mass_status)
+        if stale_reports:
+            self._log.warning(
+                f"Adding {len(stale_reports)} stale cached QMT DAY order(s) as EXPIRED "
+                "to startup reconciliation mass status",
+                LogColor.YELLOW,
+            )
+            mass_status.add_order_reports(stale_reports)
+
+        return mass_status
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
         if self._session_id is None:
@@ -448,7 +543,7 @@ class QMTExecutionClient(LiveExecutionClient):
         if client_order_id is not None:
             self._known_client_order_ids[venue_order_id] = client_order_id
 
-        status = qmt_lifecycle_to_order_status(raw_order.get("lifecycle_status"))
+        status = _qmt_order_status(raw_order, now=self._clock.utc_now())
         previous_status = self._known_order_status.get(venue_order_id)
         if previous_status == status:
             return
@@ -493,7 +588,7 @@ class QMTExecutionClient(LiveExecutionClient):
                 ts_event=ts_event,
             )
             self._terminal_events.add(venue_order_id)
-        elif lifecycle == QMT_LIFECYCLE_EXPIRED:
+        elif lifecycle == QMT_LIFECYCLE_EXPIRED or status == OrderStatus.EXPIRED:
             self.generate_order_expired(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
@@ -542,6 +637,7 @@ class QMTExecutionClient(LiveExecutionClient):
         order_volume = int(raw_order.get("order_volume", 0) or 0)
         if order_volume <= 0:
             return None
+        status = _qmt_order_status(raw_order, now=self._clock.utc_now())
         ts = millis_to_nanos(raw_order.get("order_time_ms")) or self._clock.timestamp_ns()
         return OrderStatusReport(
             account_id=self.account_id,
@@ -551,7 +647,7 @@ class QMTExecutionClient(LiveExecutionClient):
             order_side=qmt_side_to_nautilus(raw_order.get("order_type")),
             order_type=qmt_order_type_from_price_type(int(raw_order.get("price_type", 0) or 0)),
             time_in_force=TimeInForce.DAY,
-            order_status=qmt_lifecycle_to_order_status(raw_order.get("lifecycle_status")),
+            order_status=status,
             quantity=Quantity.from_int(order_volume),
             filled_qty=Quantity.from_int(int(raw_order.get("traded_volume", 0) or 0)),
             price=Price.from_str(f"{price:.2f}") if price > 0 else None,
@@ -561,8 +657,60 @@ class QMTExecutionClient(LiveExecutionClient):
             ts_last=ts,
             ts_init=self._clock.timestamp_ns(),
             cancel_reason=raw_order.get("status_msg")
-            if qmt_lifecycle_to_order_status(raw_order.get("lifecycle_status")) == OrderStatus.CANCELED
+            if status == OrderStatus.CANCELED
             else None,
+        )
+
+    def _stale_cached_open_order_reports(
+        self,
+        mass_status: ExecutionMassStatus,
+    ) -> list[OrderStatusReport]:
+        reported_client_order_ids: set[ClientOrderId] = set()
+        reported_venue_order_ids: set[VenueOrderId] = set()
+
+        for report in mass_status.order_reports.values():
+            if report.client_order_id is not None:
+                reported_client_order_ids.add(report.client_order_id)
+            if report.venue_order_id is not None:
+                reported_venue_order_ids.add(report.venue_order_id)
+
+        reports: list[OrderStatusReport] = []
+        now = self._clock.utc_now()
+        for order in self._cache.orders_open(venue=self.venue, account_id=self.account_id):
+            if order.client_order_id in reported_client_order_ids:
+                continue
+            if order.venue_order_id is None or order.venue_order_id in reported_venue_order_ids:
+                continue
+            if order.time_in_force != TimeInForce.DAY:
+                continue
+            if order.status not in _QMT_STALE_DAY_ORDER_STATUSES:
+                continue
+            if not _is_prior_qmt_day(order.ts_last, now=now):
+                continue
+
+            reports.append(self._cached_order_expired_report(order))
+
+        return reports
+
+    def _cached_order_expired_report(self, order: Order) -> OrderStatusReport:
+        ts_last = order.ts_last or self._clock.timestamp_ns()
+        return OrderStatusReport(
+            account_id=self.account_id,
+            instrument_id=order.instrument_id,
+            venue_order_id=order.venue_order_id,
+            client_order_id=order.client_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=TimeInForce.DAY,
+            order_status=OrderStatus.EXPIRED,
+            quantity=order.quantity,
+            filled_qty=order.filled_qty,
+            price=order.price if order.has_price else None,
+            avg_px=Decimal(str(order.avg_px)) if order.avg_px > 0 else None,
+            report_id=UUID4(),
+            ts_accepted=ts_last,
+            ts_last=ts_last,
+            ts_init=self._clock.timestamp_ns(),
         )
 
     def _parse_fill_report(self, raw_trade: dict[str, Any]) -> FillReport | None:
