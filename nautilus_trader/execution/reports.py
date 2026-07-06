@@ -897,6 +897,7 @@ class PositionStatusReport(ExecutionReport):
         ts_init: int,
         venue_position_id: PositionId | None = None,
         avg_px_open: Decimal | None = None,
+        can_use_volume: Decimal | None = None,
     ) -> None:
         super().__init__(
             account_id,
@@ -908,6 +909,9 @@ class PositionStatusReport(ExecutionReport):
         self.position_side = position_side
         self.quantity = quantity
         self.avg_px_open = avg_px_open
+        # Venue-reported sellable quantity (e.g. QMT `可用数量` / `can_use_volume`), if provided.
+        # `None` means the venue did not report it (default for all non-QMT adapters).
+        self.can_use_volume = can_use_volume
         self.signed_decimal_qty = (
             -self.quantity.as_decimal()
             if position_side == PositionSide.SHORT
@@ -943,6 +947,7 @@ class PositionStatusReport(ExecutionReport):
             f"quantity={self.quantity.to_formatted_str()}, "
             f"avg_px_open={self.avg_px_open}, "
             f"signed_decimal_qty={self.signed_decimal_qty}, "
+            f"can_use_volume={self.can_use_volume}, "
             f"report_id={self.id}, "
             f"ts_last={self.ts_last}, "
             f"ts_init={self.ts_init})"
@@ -968,6 +973,7 @@ class PositionStatusReport(ExecutionReport):
             "ts_init": self.ts_init,
             "venue_position_id": self.venue_position_id.value if self.venue_position_id else None,
             "avg_px_open": str(self.avg_px_open) if self.avg_px_open else None,
+            "can_use_volume": str(self.can_use_volume) if self.can_use_volume is not None else None,
         }
 
     @classmethod
@@ -997,6 +1003,9 @@ class PositionStatusReport(ExecutionReport):
                 PositionId(values["venue_position_id"]) if values["venue_position_id"] else None
             ),
             avg_px_open=(Decimal(values["avg_px_open"]) if values.get("avg_px_open") else None),
+            can_use_volume=(
+                Decimal(values["can_use_volume"]) if values.get("can_use_volume") is not None else None
+            ),
         )
 
     def to_pyo3(self) -> nautilus_pyo3.PositionStatusReport:

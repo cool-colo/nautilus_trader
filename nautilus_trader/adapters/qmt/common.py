@@ -25,13 +25,18 @@ from nautilus_trader.adapters.qmt.constants import QMT_VENUE
 from nautilus_trader.model.currencies import CNY
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.enums import AggressorSide
 from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
+from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
@@ -119,7 +124,9 @@ def parse_equity(
     )
 
 
-def parse_quote_tick(instrument_id: InstrumentId, payload: dict[str, object], ts_init: int) -> QuoteTick | None:
+def parse_quote_tick(
+    instrument_id: InstrumentId, payload: dict[str, object], ts_init: int
+) -> QuoteTick | None:
     bid_prices = payload.get("bid_price") or []
     ask_prices = payload.get("ask_price") or []
     bid_volumes = payload.get("bid_vol") or []
@@ -144,6 +151,80 @@ def parse_quote_tick(instrument_id: InstrumentId, payload: dict[str, object], ts
     )
 
 
+def parse_order_book_depth10(
+    instrument_id: InstrumentId,
+    payload: dict[str, object],
+    ts_init: int,
+) -> OrderBookDepth10 | None:
+    bid_prices = payload.get("bid_price") or []
+    ask_prices = payload.get("ask_price") or []
+    bid_volumes = payload.get("bid_vol") or []
+    ask_volumes = payload.get("ask_vol") or []
+    depth = min(len(bid_prices), len(ask_prices), len(bid_volumes), len(ask_volumes), 10)
+    if depth <= 0:
+        return None
+
+    bids: list[BookOrder] = []
+    asks: list[BookOrder] = []
+    bid_counts: list[int] = []
+    ask_counts: list[int] = []
+    for level in range(depth):
+        try:
+            bid_price = float(bid_prices[level] or 0.0)
+            ask_price = float(ask_prices[level] or 0.0)
+            bid_volume = int(bid_volumes[level] or 0)
+            ask_volume = int(ask_volumes[level] or 0)
+        except (TypeError, ValueError):
+            break
+        if bid_price <= 0 or ask_price <= 0 or bid_volume <= 0 or ask_volume <= 0:
+            break
+        bids.append(
+            BookOrder(
+                side=OrderSide.BUY,
+                price=Price.from_str(f"{bid_price:.2f}"),
+                size=Quantity.from_int(bid_volume),
+                order_id=level + 1,
+            ),
+        )
+        asks.append(
+            BookOrder(
+                side=OrderSide.SELL,
+                price=Price.from_str(f"{ask_price:.2f}"),
+                size=Quantity.from_int(ask_volume),
+                order_id=level + 11,
+            ),
+        )
+        # QMT tick depth gives aggregate level volume, not per-level order count.
+        bid_counts.append(0)
+        ask_counts.append(0)
+
+    if not bids:
+        return None
+    ts_event = millis_to_nanos(payload.get("time_ms")) or ts_init
+    return OrderBookDepth10(
+        instrument_id=instrument_id,
+        bids=bids,
+        asks=asks,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=0,
+        sequence=_sequence_from_payload(payload),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def _sequence_from_payload(payload: dict[str, object]) -> int:
+    for key in ("sequence", "seq", "last_seq", "lastSeq"):
+        try:
+            value = int(payload.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
 def parse_bar(bar_type: BarType, payload: dict[str, object], ts_init: int) -> Bar | None:
     try:
         open_price = float(payload.get("open", 0.0) or 0.0)
@@ -162,6 +243,59 @@ def parse_bar(bar_type: BarType, payload: dict[str, object], ts_init: int) -> Ba
         low=Price.from_str(f"{low_price:.2f}"),
         close=Price.from_str(f"{close_price:.2f}"),
         volume=Quantity.from_int(int(payload.get("volume", 0) or 0)),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+# QMT Level2 逐笔成交 tradeFlag: 0 未知 / 1 外盘(主动买) / 2 内盘(主动卖) / 3 撤单(深交所)
+QMT_TRADE_FLAG_CANCEL = 3
+
+
+def qmt_trade_flag_to_aggressor(value: object) -> AggressorSide:
+    try:
+        flag = int(value or 0)
+    except (TypeError, ValueError):
+        return AggressorSide.NO_AGGRESSOR
+    if flag == 1:
+        return AggressorSide.BUYER
+    if flag == 2:
+        return AggressorSide.SELLER
+    return AggressorSide.NO_AGGRESSOR
+
+
+def parse_trade_tick(
+    instrument_id: InstrumentId,
+    payload: dict[str, object],
+    ts_init: int,
+) -> TradeTick | None:
+    # Level2 逐笔成交 record from quant-qmt-proxy (native xtquant schema, snake_cased).
+    try:
+        flag = int(payload.get("trade_flag", 0) or 0)
+    except (TypeError, ValueError):
+        flag = 0
+    if flag == QMT_TRADE_FLAG_CANCEL:
+        return None  # 深交所撤单 is not a trade
+    try:
+        price = float(payload.get("price", 0.0) or 0.0)
+        volume = int(payload.get("volume", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0 or volume <= 0:
+        return None
+    ts_event = millis_to_nanos(payload.get("time_ms")) or ts_init
+    trade_index = payload.get("trade_index")
+    # trade_index is the 成交编号; synthesize a stable id when the venue omits it (0/None).
+    if trade_index in (None, 0, "0", ""):
+        trade_id = TradeId(f"{normalize_qmt_symbol(instrument_id.symbol.value)}-{ts_event}")
+    else:
+        trade_id = TradeId(str(trade_index))
+    return TradeTick(
+        instrument_id=instrument_id,
+        price=Price.from_str(f"{price:.2f}"),
+        size=Quantity.from_int(volume),
+        aggressor_side=qmt_trade_flag_to_aggressor(payload.get("trade_flag")),
+        trade_id=trade_id,
         ts_event=ts_event,
         ts_init=ts_init,
     )

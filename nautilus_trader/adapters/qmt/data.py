@@ -23,7 +23,9 @@ import aiohttp
 from nautilus_trader.adapters.qmt.common import bar_type_to_qmt_period
 from nautilus_trader.adapters.qmt.common import instrument_id_to_qmt_symbol
 from nautilus_trader.adapters.qmt.common import parse_bar
+from nautilus_trader.adapters.qmt.common import parse_order_book_depth10
 from nautilus_trader.adapters.qmt.common import parse_quote_tick
+from nautilus_trader.adapters.qmt.common import parse_trade_tick
 from nautilus_trader.adapters.qmt.common import timestamp_to_qmt_str
 from nautilus_trader.adapters.qmt.config import QMTDataClientConfig
 from nautilus_trader.adapters.qmt.constants import QMT_VENUE
@@ -40,10 +42,14 @@ from nautilus_trader.data.messages import RequestInstruments
 from nautilus_trader.data.messages import RequestQuoteTicks
 from nautilus_trader.data.messages import SubscribeBars
 from nautilus_trader.data.messages import SubscribeData
+from nautilus_trader.data.messages import SubscribeOrderBook
 from nautilus_trader.data.messages import SubscribeQuoteTicks
+from nautilus_trader.data.messages import SubscribeTradeTicks
 from nautilus_trader.data.messages import UnsubscribeBars
 from nautilus_trader.data.messages import UnsubscribeData
+from nautilus_trader.data.messages import UnsubscribeOrderBook
 from nautilus_trader.data.messages import UnsubscribeQuoteTicks
+from nautilus_trader.data.messages import UnsubscribeTradeTicks
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
@@ -118,16 +124,61 @@ class QMTDataClient(LiveMarketDataClient):
             count=0,
         )
         subscription_id = info["subscription_id"]
-        self._subscription_ids[instrument_id] = subscription_id
+        key = ("quote", instrument_id)
+        self._subscription_ids[key] = subscription_id
         task = self.create_task(
             self._stream_subscription(subscription_id, instrument_id=instrument_id),
             log_msg=f"qmt_quote_stream: {instrument_id}",
         )
         if task is not None:
-            self._subscription_tasks[instrument_id] = task
+            self._subscription_tasks[key] = task
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
-        await self._unsubscribe_key(command.instrument_id)
+        await self._unsubscribe_key(("quote", command.instrument_id))
+
+    async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
+        instrument_id = command.instrument_id
+        symbol = instrument_id_to_qmt_symbol(instrument_id)
+        info = await self._http_client.create_quote_subscription(
+            symbols=[symbol],
+            period="tick",
+            adjust_type=self._config.adjust_type,
+            count=0,
+        )
+        subscription_id = info["subscription_id"]
+        key = ("depth", instrument_id)
+        self._subscription_ids[key] = subscription_id
+        task = self.create_task(
+            self._stream_subscription(subscription_id, depth_instrument_id=instrument_id),
+            log_msg=f"qmt_depth_stream: {instrument_id}",
+        )
+        if task is not None:
+            self._subscription_tasks[key] = task
+
+    async def _unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
+        await self._unsubscribe_key(("depth", command.instrument_id))
+
+    async def _subscribe_trade_ticks(self, command: SubscribeTradeTicks) -> None:
+        instrument_id = command.instrument_id
+        symbol = instrument_id_to_qmt_symbol(instrument_id)
+        info = await self._http_client.create_quote_subscription(
+            symbols=[symbol],
+            period="l2transaction",
+            adjust_type=self._config.adjust_type,
+            count=0,
+        )
+        subscription_id = info["subscription_id"]
+        key = ("trade", instrument_id)
+        self._subscription_ids[key] = subscription_id
+        task = self.create_task(
+            self._stream_subscription(subscription_id, trade_instrument_id=instrument_id),
+            log_msg=f"qmt_trade_stream: {instrument_id}",
+        )
+        if task is not None:
+            self._subscription_tasks[key] = task
+
+    async def _unsubscribe_trade_ticks(self, command: UnsubscribeTradeTicks) -> None:
+        await self._unsubscribe_key(("trade", command.instrument_id))
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         bar_type = command.bar_type
@@ -140,16 +191,17 @@ class QMTDataClient(LiveMarketDataClient):
             count=0,
         )
         subscription_id = info["subscription_id"]
-        self._subscription_ids[bar_type] = subscription_id
+        key = ("bar", bar_type)
+        self._subscription_ids[key] = subscription_id
         task = self.create_task(
             self._stream_subscription(subscription_id, bar_type=bar_type),
             log_msg=f"qmt_bar_stream: {bar_type}",
         )
         if task is not None:
-            self._subscription_tasks[bar_type] = task
+            self._subscription_tasks[key] = task
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
-        await self._unsubscribe_key(command.bar_type)
+        await self._unsubscribe_key(("bar", command.bar_type))
 
     async def _request(self, request: RequestData) -> None:
         raise NotImplementedError("QMT custom data requests are not implemented")
@@ -247,35 +299,44 @@ class QMTDataClient(LiveMarketDataClient):
         subscription_id: str,
         instrument_id: InstrumentId | None = None,
         bar_type=None,
+        trade_instrument_id: InstrumentId | None = None,
+        depth_instrument_id: InstrumentId | None = None,
     ) -> None:
         url = f"{self._ws_base_url}/ws/quote/{subscription_id}"
         if self._config.api_key:
             url = f"{url}?{urlencode({'token': self._config.api_key})}"
 
-        label = bar_type if bar_type is not None else instrument_id
+        label = bar_type or instrument_id or trade_instrument_id or depth_instrument_id
         backoff = 1.0
         max_backoff = 30.0
         failure_streak = 0
         while True:
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url) as ws:
-                        if failure_streak:
-                            self._log.info(
-                                f"QMT quote stream reconnected for {label} "
-                                f"after {failure_streak} failure(s)",
-                            )
-                            failure_streak = 0
-                            backoff = 1.0
-                        await self._consume_ws(ws, instrument_id=instrument_id, bar_type=bar_type)
+                async with (
+                    aiohttp.ClientSession() as session,
+                    session.ws_connect(url) as ws,
+                ):
+                    if failure_streak:
+                        self._log.info(
+                            f"QMT quote stream reconnected for {label} "
+                            f"after {failure_streak} failure(s)",
+                        )
+                        failure_streak = 0
+                        backoff = 1.0
+                    await self._consume_ws(
+                        ws,
+                        instrument_id=instrument_id,
+                        bar_type=bar_type,
+                        trade_instrument_id=trade_instrument_id,
+                        depth_instrument_id=depth_instrument_id,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 failure_streak += 1
                 if failure_streak == 1 or failure_streak % 30 == 0:
                     self._log.warning(
-                        f"QMT quote stream for {label} failed "
-                        f"(streak={failure_streak}): {exc}",
+                        f"QMT quote stream for {label} failed (streak={failure_streak}): {exc}",
                     )
             else:
                 # ws_connect exited cleanly (server closed). Treat as a drop and reconnect.
@@ -291,38 +352,62 @@ class QMTDataClient(LiveMarketDataClient):
         ws,
         instrument_id: InstrumentId | None = None,
         bar_type=None,
+        trade_instrument_id: InstrumentId | None = None,
+        depth_instrument_id: InstrumentId | None = None,
     ) -> None:
         async for message in ws:
             if message.type == aiohttp.WSMsgType.TEXT:
-                payload = message.json()
-                msg_type = payload.get("type")
-                if msg_type == "error":
-                    # e.g. "missing-subscription" if the proxy lost the subscription
-                    # (proxy restart). Surface it; the reconnect loop will keep retrying.
-                    self._log.warning(f"QMT quote stream error message: {payload.get('message')}")
-                    continue
-                if msg_type != "quote":
-                    continue
-                event = payload.get("data") or {}
-                data = event.get("data") or {}
-                if event.get("payload_type") == "tick" and instrument_id is not None:
-                    tick = parse_quote_tick(
-                        instrument_id=instrument_id,
-                        payload=data,
-                        ts_init=self._clock.timestamp_ns(),
-                    )
-                    if tick is not None:
-                        self._handle_data(tick)
-                elif event.get("payload_type") == "kline" and bar_type is not None:
-                    bar = parse_bar(
-                        bar_type=bar_type,
-                        payload=data,
-                        ts_init=self._clock.timestamp_ns(),
-                    )
-                    if bar is not None:
-                        self._handle_data(bar)
+                self._dispatch_ws_message(
+                    message.json(),
+                    instrument_id=instrument_id,
+                    bar_type=bar_type,
+                    trade_instrument_id=trade_instrument_id,
+                    depth_instrument_id=depth_instrument_id,
+                )
             elif message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
                 break
+
+    def _dispatch_ws_message(
+        self,
+        payload: dict,
+        instrument_id: InstrumentId | None,
+        bar_type,
+        trade_instrument_id: InstrumentId | None,
+        depth_instrument_id: InstrumentId | None,
+    ) -> None:
+        msg_type = payload.get("type")
+        if msg_type == "error":
+            # e.g. "missing-subscription" if the proxy lost the subscription
+            # (proxy restart). Surface it; the reconnect loop will keep retrying.
+            self._log.warning(f"QMT quote stream error message: {payload.get('message')}")
+            return
+        if msg_type != "quote":
+            return
+        event = payload.get("data") or {}
+        data = event.get("data") or {}
+        payload_type = event.get("payload_type")
+        ts_init = self._clock.timestamp_ns()
+
+        parsed = None
+        if payload_type == "tick" and instrument_id is not None:
+            parsed = parse_quote_tick(instrument_id=instrument_id, payload=data, ts_init=ts_init)
+        elif payload_type == "l2transaction" and trade_instrument_id is not None:
+            parsed = parse_trade_tick(
+                instrument_id=trade_instrument_id, payload=data, ts_init=ts_init
+            )
+        elif payload_type == "kline" and bar_type is not None:
+            parsed = parse_bar(bar_type=bar_type, payload=data, ts_init=ts_init)
+
+        if parsed is not None:
+            self._handle_data(parsed)
+        if payload_type == "tick" and depth_instrument_id is not None:
+            depth = parse_order_book_depth10(
+                instrument_id=depth_instrument_id,
+                payload=data,
+                ts_init=ts_init,
+            )
+            if depth is not None:
+                self._handle_data(depth)
 
     def _send_all_instruments_to_data_engine(self) -> None:
         for instrument in self._instrument_provider.get_all().values():

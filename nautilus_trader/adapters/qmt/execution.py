@@ -457,6 +457,12 @@ class QMTExecutionClient(LiveExecutionClient):
             volume = int(raw_position.get("volume", 0) or 0)
             quantity = Quantity.from_int(volume)
             side = PositionSide.LONG if volume > 0 else PositionSide.FLAT
+            # QMT reports `can_use_volume` (可用数量): the T+1-eligible sellable quantity,
+            # already net of today's buys, frozen, and in-transit shares. Carry it through so
+            # the strategy can size sells against broker ground truth instead of inferring
+            # today's buys from reconciliation-rebuilt fill timestamps.
+            raw_can_use = raw_position.get("can_use_volume")
+            can_use_volume = Decimal(str(raw_can_use)) if raw_can_use is not None else None
             reports.append(
                 PositionStatusReport(
                     account_id=self.account_id,
@@ -464,6 +470,7 @@ class QMTExecutionClient(LiveExecutionClient):
                     position_side=side,
                     quantity=quantity,
                     avg_px_open=Decimal(str(raw_position.get("avg_price", "0") or "0")),
+                    can_use_volume=can_use_volume,
                     report_id=UUID4(),
                     ts_last=ts_init,
                     ts_init=ts_init,
