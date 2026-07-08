@@ -17,10 +17,12 @@ import pytest
 
 from nautilus_trader.adapters.qmt.common import parse_order_book_depth10
 from nautilus_trader.adapters.qmt.common import parse_trade_tick
+from nautilus_trader.adapters.qmt.common import qmt_lifecycle_to_order_status
 from nautilus_trader.adapters.qmt.common import qmt_trade_flag_to_aggressor
 from nautilus_trader.adapters.qmt.constants import QMT_VENUE
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 
@@ -57,6 +59,10 @@ def _record(**overrides):
 )
 def test_qmt_trade_flag_to_aggressor(flag, expected):
     assert qmt_trade_flag_to_aggressor(flag) == expected
+
+
+def test_qmt_pending_cancel_lifecycle_maps_to_nautilus_pending_cancel():
+    assert qmt_lifecycle_to_order_status("PENDING_CANCEL") == OrderStatus.PENDING_CANCEL
 
 
 def test_parse_trade_tick_happy_path():

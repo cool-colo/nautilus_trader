@@ -90,6 +90,7 @@ _QMT_OPEN_ORDER_STATUSES = {
 _QMT_STALE_DAY_ORDER_STATUSES = {
     OrderStatus.ACCEPTED,
     OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.PENDING_CANCEL,
     OrderStatus.SUBMITTED,
 }
 
@@ -563,6 +564,9 @@ class QMTExecutionClient(LiveExecutionClient):
             return
 
         ts_event = millis_to_nanos(raw_order.get("order_time_ms")) or self._clock.timestamp_ns()
+        if status == OrderStatus.PENDING_CANCEL:
+            return
+
         if status in {OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED}:
             if previous_status is None:
                 self.generate_order_accepted(

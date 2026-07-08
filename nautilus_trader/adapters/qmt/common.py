@@ -325,6 +325,8 @@ def qmt_lifecycle_to_order_status(value: str) -> OrderStatus:
         return OrderStatus.ACCEPTED
     if normalized == "PARTIALLY_FILLED":
         return OrderStatus.PARTIALLY_FILLED
+    if normalized == "PENDING_CANCEL":
+        return OrderStatus.PENDING_CANCEL
     if normalized == "FILLED":
         return OrderStatus.FILLED
     if normalized == "CANCELED":
