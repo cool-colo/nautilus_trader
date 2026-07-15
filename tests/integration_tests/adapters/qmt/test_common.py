@@ -13,6 +13,12 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
+from decimal import Decimal
+from datetime import datetime
+from datetime import timezone
+from types import SimpleNamespace
+
 import pytest
 
 from nautilus_trader.adapters.qmt.common import parse_order_book_depth10
@@ -20,14 +26,35 @@ from nautilus_trader.adapters.qmt.common import parse_trade_tick
 from nautilus_trader.adapters.qmt.common import qmt_lifecycle_to_order_status
 from nautilus_trader.adapters.qmt.common import qmt_trade_flag_to_aggressor
 from nautilus_trader.adapters.qmt.constants import QMT_VENUE
+from nautilus_trader.adapters.qmt.execution import QMTExecutionClient
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
+from nautilus_trader.model.objects import Quantity
 
 
 INSTRUMENT_ID = InstrumentId(symbol=Symbol("000001.SZ"), venue=QMT_VENUE)
+
+
+class _FakeClock:
+    def timestamp_ns(self) -> int:
+        return 123
+
+    def utc_now(self) -> datetime:
+        return datetime.now(tz=timezone.utc)
+
+
+class _StubExecClient:
+    account_id = AccountId("QMT-TEST")
+    _clock = _FakeClock()
+
+    _parse_order_status_report = QMTExecutionClient._parse_order_status_report
 
 
 def _record(**overrides):
@@ -63,6 +90,63 @@ def test_qmt_trade_flag_to_aggressor(flag, expected):
 
 def test_qmt_pending_cancel_lifecycle_maps_to_nautilus_pending_cancel():
     assert qmt_lifecycle_to_order_status("PENDING_CANCEL") == OrderStatus.PENDING_CANCEL
+
+
+def test_parse_order_status_report_uses_zero_avg_px_for_unfilled_order():
+    report = _StubExecClient()._parse_order_status_report(
+        {
+            "stock_code": "000001.SZ",
+            "order_id": "7788",
+            "client_order_id": "O-1",
+            "order_type": 24,
+            "price_type": 11,
+            "order_volume": 100,
+            "traded_volume": 0,
+            "price": 12.34,
+            "traded_price": 0.0,
+            "lifecycle_status": "ACCEPTED",
+            "order_time_ms": 1783473582000,
+        },
+    )
+
+    assert report is not None
+    assert report.avg_px == Decimal("0")
+
+
+def test_submit_sell_rejects_when_sellable_precheck_raises():
+    rejected = []
+
+    class _SubmitStub:
+        _clock = _FakeClock()
+        _config = SimpleNamespace(enforce_sellable_position=True, default_limit_price_type=11)
+        _session_id = "SESSION"
+
+        _submit_nautilus_order = QMTExecutionClient._submit_nautilus_order
+
+        def _order_price(self, order):
+            return 12.34
+
+        async def _get_sellable_volume(self, instrument_id):
+            raise RuntimeError("QMT proxy connection error: Connector is closed.")
+
+        def generate_order_rejected(self, **kwargs):
+            rejected.append(kwargs)
+
+    order = SimpleNamespace(
+        order_type=OrderType.LIMIT,
+        strategy_id="S-001",
+        instrument_id=INSTRUMENT_ID,
+        client_order_id=ClientOrderId("O-1"),
+        side=OrderSide.SELL,
+        quantity=Quantity.from_int(100),
+    )
+
+    asyncio.run(_SubmitStub()._submit_nautilus_order(order))
+
+    assert len(rejected) == 1
+    assert rejected[0]["instrument_id"] == INSTRUMENT_ID
+    assert rejected[0]["client_order_id"] == ClientOrderId("O-1")
+    assert "Connector is closed" in rejected[0]["reason"]
 
 
 def test_parse_trade_tick_happy_path():

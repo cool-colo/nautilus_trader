@@ -257,7 +257,17 @@ class QMTExecutionClient(LiveExecutionClient):
         price = self._order_price(order)
         if self._config.enforce_sellable_position and order.side == OrderSide.SELL:
             requested_volume = quantity_to_int(order.quantity)
-            sellable_volume, raw_position = await self._get_sellable_volume(order.instrument_id)
+            try:
+                sellable_volume, raw_position = await self._get_sellable_volume(order.instrument_id)
+            except Exception as exc:
+                self.generate_order_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    reason=str(exc),
+                    ts_event=self._clock.timestamp_ns(),
+                )
+                return
             if requested_volume > sellable_volume:
                 self.generate_order_denied(
                     strategy_id=order.strategy_id,
@@ -662,7 +672,7 @@ class QMTExecutionClient(LiveExecutionClient):
             quantity=Quantity.from_int(order_volume),
             filled_qty=Quantity.from_int(int(raw_order.get("traded_volume", 0) or 0)),
             price=Price.from_str(f"{price:.2f}") if price > 0 else None,
-            avg_px=avg_px if avg_px > 0 else None,
+            avg_px=avg_px,
             report_id=UUID4(),
             ts_accepted=ts,
             ts_last=ts,
@@ -717,7 +727,7 @@ class QMTExecutionClient(LiveExecutionClient):
             quantity=order.quantity,
             filled_qty=order.filled_qty,
             price=order.price if order.has_price else None,
-            avg_px=Decimal(str(order.avg_px)) if order.avg_px > 0 else None,
+            avg_px=Decimal(str(order.avg_px)) if order.avg_px > 0 else Decimal("0"),
             report_id=UUID4(),
             ts_accepted=ts_last,
             ts_last=ts_last,
