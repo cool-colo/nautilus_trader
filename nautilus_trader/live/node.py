@@ -193,6 +193,89 @@ class TradingNode:
         """
         return self._is_built
 
+    def health_status(self) -> dict:
+        """
+        Return a structured snapshot of the nodes health-relevant state.
+
+        This is a synchronous, side-effect-free read of current status, safe to
+        call at any time (including from a separate monitoring thread). It does
+        **not** produce a single aggregate "healthy" verdict; the caller decides
+        what constitutes healthy from the returned details.
+
+        The ``reconciliation.succeeded`` field is the result of the startup
+        execution-state reconciliation: ``True`` (succeeded), ``False`` (failed),
+        or ``None`` (not run yet, e.g. reconciliation disabled or node not
+        started). This is the most important signal to verify after a restart.
+
+        Returns
+        -------
+        dict
+            Structured health details with the following shape::
+
+                {
+                    "trader_id": str,
+                    "instance_id": str,
+                    "timestamp": str,            # ISO 8601 UTC
+                    "is_running": bool,
+                    "is_built": bool,
+                    "data_clients": {
+                        "all_connected": bool,
+                        "registered": list[str],
+                    },
+                    "exec_clients": {
+                        "all_connected": bool,
+                        "registered": list[str],
+                    },
+                    "reconciliation": {
+                        "enabled": bool,
+                        "succeeded": bool | None,
+                    },
+                    "strategies": dict[str, str],   # id -> state name
+                    "actors": dict[str, str],       # id -> state name
+                }
+
+        Examples
+        --------
+        Deriving a healthy verdict in caller code::
+
+            status = node.health_status()
+            recon = status["reconciliation"]
+            ok = (
+                status["is_running"]
+                and status["data_clients"]["all_connected"]
+                and status["exec_clients"]["all_connected"]
+                and (not recon["enabled"] or recon["succeeded"] is True)
+                and all(s == "RUNNING" for s in status["strategies"].values())
+            )
+
+        """
+        kernel = self.kernel
+        data_engine = kernel.data_engine
+        exec_engine = kernel.exec_engine
+        trader = kernel.trader
+
+        return {
+            "trader_id": str(kernel.trader_id),
+            "instance_id": str(kernel.instance_id),
+            "timestamp": kernel.clock.utc_now().isoformat(),
+            "is_running": kernel.is_running(),
+            "is_built": self._is_built,
+            "data_clients": {
+                "all_connected": data_engine.check_connected(),
+                "registered": [str(c) for c in data_engine.registered_clients],
+            },
+            "exec_clients": {
+                "all_connected": exec_engine.check_connected(),
+                "registered": [str(c) for c in exec_engine.registered_clients],
+            },
+            "reconciliation": {
+                "enabled": exec_engine.reconciliation,
+                "succeeded": exec_engine.reconciliation_succeeded,
+            },
+            "strategies": {str(k): v for k, v in trader.strategy_states().items()},
+            "actors": {str(k): v for k, v in trader.actor_states().items()},
+        }
+
     def get_event_loop(self) -> asyncio.AbstractEventLoop | None:
         """
         Return the event loop of the trading node.

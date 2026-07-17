@@ -157,6 +157,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self._inferred_fill_ts: dict[ClientOrderId, int] = {}
         self._fill_application_audit: dict[ClientOrderId, list[tuple[TradeId, str, int]]] = {}
         self._startup_reconciliation_event: asyncio.Event = asyncio.Event()
+        self._last_reconciliation_result: bool | None = None  # None = not yet run
         self._filtered_external_orders_count: int = 0
 
         self._cmd_enqueuer: ThrottledEnqueuer[Command] = ThrottledEnqueuer(
@@ -266,6 +267,20 @@ class LiveExecutionEngine(ExecutionEngine):
 
         """
         return self._reconciliation
+
+    @property
+    def reconciliation_succeeded(self) -> bool | None:
+        """
+        Return the result of the most recent startup execution state reconciliation.
+
+        Returns
+        -------
+        bool or ``None``
+            True if reconciliation succeeded, False if it failed, or ``None`` if
+            reconciliation has not run yet.
+
+        """
+        return self._last_reconciliation_result
 
     # -- LIFECYCLE ---------------------------------------------------------------------------------
 
@@ -1698,6 +1713,7 @@ class LiveExecutionEngine(ExecutionEngine):
             if not self._clients:
                 self._log.debug("No execution clients for reconciliation")
                 # Signal completion even with no clients
+                self._last_reconciliation_result = True
                 return True
 
             results: list[bool] = []
@@ -1802,7 +1818,13 @@ class LiveExecutionEngine(ExecutionEngine):
                     msg=mass_status,
                 )
 
-            return all(results)
+            reconciled = all(results)
+            self._last_reconciliation_result = reconciled
+            return reconciled
+        except BaseException:
+            # Record failure so health checks can observe an errored reconciliation
+            self._last_reconciliation_result = False
+            raise
         finally:
             # Always signal completion to prevent continuous loop signal await hang
             self._startup_reconciliation_event.set()
