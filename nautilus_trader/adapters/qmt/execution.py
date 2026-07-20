@@ -105,9 +105,22 @@ def _coerce_utc_datetime(value: datetime | Any) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _qmt_order_status(raw_order: dict[str, Any], now: datetime | None = None) -> OrderStatus:
+def _qmt_order_status(
+    raw_order: dict[str, Any],
+    now: datetime | None = None,
+    allow_stale_day_expiry: bool = True,
+) -> OrderStatus:
     status = qmt_lifecycle_to_order_status(raw_order.get("lifecycle_status"))
     if status not in _QMT_STALE_DAY_ORDER_STATUSES:
+        return status
+
+    # The "stale DAY order -> EXPIRED" downgrade below infers expiry purely from the
+    # order's date (order_time_ms). It is only safe during reconciliation, where the
+    # goal is to purge overnight leftovers the venue no longer knows. On the live poll
+    # path a bad/stale order_time_ms would wrongly expire a still-open same-day order,
+    # so callers there pass allow_stale_day_expiry=False and get the raw lifecycle
+    # mapping instead.
+    if not allow_stale_day_expiry:
         return status
 
     order_time_ms = raw_order.get("order_time_ms")
@@ -409,7 +422,13 @@ class QMTExecutionClient(LiveExecutionClient):
             return []
         reports = []
         for raw_order in await self._http_client.get_orders(self._session_id, cancelable_only=False):
-            status = _qmt_order_status(raw_order, now=self._clock.utc_now())
+            # Reconciliation path: keep the stale-DAY-order -> EXPIRED downgrade so
+            # overnight leftovers the venue no longer knows are purged from the cache.
+            status = _qmt_order_status(
+                raw_order,
+                now=self._clock.utc_now(),
+                allow_stale_day_expiry=True,
+            )
             if command.open_only and status not in _QMT_OPEN_ORDER_STATUSES:
                 continue
             report = self._parse_order_status_report(raw_order)
@@ -561,7 +580,16 @@ class QMTExecutionClient(LiveExecutionClient):
         if client_order_id is not None:
             self._known_client_order_ids[venue_order_id] = client_order_id
 
-        status = _qmt_order_status(raw_order, now=self._clock.utc_now())
+        # Live poll path: do NOT apply the date-based "stale DAY order -> EXPIRED"
+        # downgrade. A same-day open order must never be expired here just because the
+        # proxy reported a wrong/stale order_time_ms (xtquant order_time can carry the
+        # prior trading day's date for a live order); overnight-leftover cleanup is the
+        # reconciliation path's job.
+        status = _qmt_order_status(
+            raw_order,
+            now=self._clock.utc_now(),
+            allow_stale_day_expiry=False,
+        )
         previous_status = self._known_order_status.get(venue_order_id)
         if previous_status == status:
             return
