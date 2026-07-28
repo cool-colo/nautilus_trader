@@ -67,6 +67,8 @@ class QMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
         QMT security account type.
     base_url_http : str, default "http://127.0.0.1:8000"
         Base HTTP URL for quant-qmt-proxy.
+    base_url_ws : str, default "ws://127.0.0.1:8000"
+        Base WebSocket URL for quant-qmt-proxy trading event streams.
     api_key : str, optional
         Bearer token for quant-qmt-proxy, if proxy authentication is enabled.
     poll_interval_secs : PositiveFloat, default 1.0
@@ -82,6 +84,7 @@ class QMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
     account_id: str
     account_type: str = "STOCK"
     base_url_http: str = QMT_DEFAULT_HTTP_URL
+    base_url_ws: str = QMT_DEFAULT_WS_URL
     api_key: str | None = None
     venue: Venue = QMT_VENUE
     instrument_provider: QMTInstrumentProviderConfig | None = None

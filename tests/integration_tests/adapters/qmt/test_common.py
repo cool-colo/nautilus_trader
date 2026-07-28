@@ -14,24 +14,30 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
-from decimal import Decimal
 from datetime import datetime
 from datetime import timezone
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
+from nautilus_trader.adapters.qmt.common import parse_equity
 from nautilus_trader.adapters.qmt.common import parse_order_book_depth10
 from nautilus_trader.adapters.qmt.common import parse_trade_tick
+from nautilus_trader.adapters.qmt.common import qmt_instrument_status
+from nautilus_trader.adapters.qmt.common import qmt_is_suspended
 from nautilus_trader.adapters.qmt.common import qmt_lifecycle_to_order_status
 from nautilus_trader.adapters.qmt.common import qmt_trade_flag_to_aggressor
 from nautilus_trader.adapters.qmt.constants import QMT_VENUE
 from nautilus_trader.adapters.qmt.execution import QMTExecutionClient
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggressorSide
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
@@ -50,11 +56,57 @@ class _FakeClock:
         return datetime.now(tz=timezone.utc)
 
 
+class _FakeHttpClient:
+    def __init__(self, positions):
+        self._positions = positions
+
+    async def get_positions(self, session_id):
+        assert session_id == "SESSION"
+        return self._positions
+
+
+class _FakeLog:
+    def __init__(self):
+        self.errors = []
+        self.warnings = []
+
+    def error(self, message):
+        self.errors.append(message)
+
+    def warning(self, message):
+        self.warnings.append(message)
+
+
 class _StubExecClient:
     account_id = AccountId("QMT-TEST")
     _clock = _FakeClock()
 
     _parse_order_status_report = QMTExecutionClient._parse_order_status_report
+    generate_position_status_reports = QMTExecutionClient.generate_position_status_reports
+
+    def __init__(self, positions=()):
+        self._http_client = _FakeHttpClient(positions)
+        self._log = _FakeLog()
+        self._session_id = "SESSION"
+
+
+class _DispatchStub:
+    _dispatch_trading_ws_message = QMTExecutionClient._dispatch_trading_ws_message
+
+    def __init__(self):
+        self.orders = []
+        self.trades = []
+        self.assets = []
+        self._log = _FakeLog()
+
+    def _handle_order_update(self, raw_order):
+        self.orders.append(raw_order)
+
+    def _handle_trade_update(self, raw_trade):
+        self.trades.append(raw_trade)
+
+    def _handle_asset_update(self, asset, force=False):
+        self.assets.append((asset, force))
 
 
 def _record(**overrides):
@@ -113,6 +165,33 @@ def test_parse_order_status_report_uses_zero_avg_px_for_unfilled_order():
     assert report.avg_px == Decimal("0")
 
 
+def test_generate_position_status_reports_skips_invalid_quantity():
+    client = _StubExecClient(
+        [
+            {"stock_code": "000001.SZ", "volume": -100, "avg_price": 11.0},
+            {"stock_code": "000002.SZ", "volume": 200, "avg_price": 12.3},
+        ],
+    )
+    command = GeneratePositionStatusReports(
+        instrument_id=None,
+        start=None,
+        end=None,
+        command_id=UUID4(),
+        ts_init=client._clock.timestamp_ns(),
+    )
+
+    reports = asyncio.run(client.generate_position_status_reports(command))
+
+    assert len(reports) == 1
+    assert reports[0].instrument_id == InstrumentId(symbol=Symbol("000002.SZ"), venue=QMT_VENUE)
+    assert reports[0].position_side == PositionSide.LONG
+    assert reports[0].quantity.as_double() == 200
+    assert len(client._log.errors) == 1
+    assert "Cannot generate QMT position status report" in client._log.errors[0]
+    assert "can't convert negative value to uint128_t" in client._log.errors[0]
+    assert "raw_position" in client._log.errors[0]
+
+
 def test_submit_sell_rejects_when_sellable_precheck_raises():
     rejected = []
 
@@ -147,6 +226,43 @@ def test_submit_sell_rejects_when_sellable_precheck_raises():
     assert rejected[0]["instrument_id"] == INSTRUMENT_ID
     assert rejected[0]["client_order_id"] == ClientOrderId("O-1")
     assert "Connector is closed" in rejected[0]["reason"]
+
+
+def test_qmt_execution_dispatches_trading_websocket_messages():
+    client = _DispatchStub()
+
+    client._dispatch_trading_ws_message(
+        {
+            "type": "trading",
+            "data": {
+                "event_type": "order_update",
+                "payload": {"order_id": "1", "client_order_id": "O-1"},
+            },
+        },
+    )
+    client._dispatch_trading_ws_message(
+        {
+            "type": "trading",
+            "data": {
+                "event_type": "trade_update",
+                "payload": {"traded_id": "T-1", "client_order_id": "O-1"},
+            },
+        },
+    )
+    client._dispatch_trading_ws_message(
+        {
+            "type": "trading",
+            "data": {
+                "event_type": "asset_update",
+                "payload": {"cash": 1, "frozen_cash": 2},
+            },
+        },
+    )
+    client._dispatch_trading_ws_message({"type": "heartbeat"})
+
+    assert client.orders == [{"order_id": "1", "client_order_id": "O-1"}]
+    assert client.trades == [{"traded_id": "T-1", "client_order_id": "O-1"}]
+    assert client.assets == [({"cash": 1, "frozen_cash": 2}, False)]
 
 
 def test_parse_trade_tick_happy_path():
@@ -188,6 +304,63 @@ def test_parse_trade_tick_synthesizes_trade_id_when_missing():
     assert trade is not None
     # Synthesized from symbol + ts_event so ids stay unique and non-empty.
     assert str(trade.trade_id) == f"000001.SZ-{1733118954000 * 1_000_000}"
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"InstrumentStatus": "0"}, 0),  # normal, QMT returns strings
+        ({"InstrumentStatus": "6"}, 6),  # suspended
+        ({"InstrumentStatus": 6}, 6),  # already an int
+        ({"InstrumentStatus": ""}, None),  # empty
+        ({"InstrumentStatus": "abc"}, None),  # unparseable
+        ({}, None),  # absent
+        (None, None),
+    ],
+)
+def test_qmt_instrument_status(fields, expected):
+    assert qmt_instrument_status(fields) == expected
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"InstrumentStatus": "0"}, False),  # normal (600519.SH observed)
+        ({"InstrumentStatus": "6"}, True),  # suspended (688277.SH observed)
+        ({"InstrumentStatus": "1"}, True),  # boundary: >= 1 is suspended
+        # IsTrading must NOT override the InstrumentStatus rule — normal stocks
+        # read IsTrading=False outside trading hours.
+        ({"InstrumentStatus": "0", "IsTrading": "False"}, False),
+        ({}, None),  # unknown, not "trading"
+        (None, None),
+    ],
+)
+def test_qmt_is_suspended(fields, expected):
+    assert qmt_is_suspended(fields) is expected
+
+
+def test_parse_equity_exposes_suspension_flags():
+    suspended = parse_equity(
+        symbol="688277.SH",
+        fields={"InstrumentName": "天智航-U", "InstrumentStatus": "6", "IsTrading": "False"},
+        ts_event=1,
+        ts_init=2,
+    )
+    assert suspended.info["is_suspended"] is True
+    assert suspended.info["instrument_status"] == 6
+
+    normal = parse_equity(
+        symbol="600519.SH",
+        fields={"InstrumentName": "贵州茅台", "InstrumentStatus": "0"},
+        ts_event=1,
+        ts_init=2,
+    )
+    assert normal.info["is_suspended"] is False
+    assert normal.info["instrument_status"] == 0
+
+    unknown = parse_equity(symbol="000001.SZ", fields={}, ts_event=1, ts_init=2)
+    assert unknown.info["is_suspended"] is None
+    assert unknown.info["instrument_status"] is None
 
 
 def test_parse_trade_tick_falls_back_ts_event_to_ts_init():

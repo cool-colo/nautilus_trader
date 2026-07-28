@@ -20,7 +20,10 @@ from datetime import datetime
 from datetime import timezone
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
+
+import aiohttp
 
 from nautilus_trader.adapters.qmt.common import instrument_id_to_qmt_symbol
 from nautilus_trader.adapters.qmt.common import millis_to_nanos
@@ -93,6 +96,8 @@ _QMT_STALE_DAY_ORDER_STATUSES = {
     OrderStatus.PENDING_CANCEL,
     OrderStatus.SUBMITTED,
 }
+_QMT_USE_TRADING_WEBSOCKET = True
+_QMT_CALLBACK_FALLBACK_POLL_INTERVAL_SECS = 10.0
 
 
 def _coerce_utc_datetime(value: datetime | Any) -> datetime:
@@ -200,8 +205,10 @@ class QMTExecutionClient(LiveExecutionClient):
         )
         self._http_client = http_client
         self._config = config
+        self._ws_base_url = config.base_url_ws.rstrip("/")
         self._session_id: str | None = None
         self._poll_task: asyncio.Task | None = None
+        self._trading_stream_task: asyncio.Task | None = None
         self._known_order_status: dict[VenueOrderId, OrderStatus] = {}
         self._known_client_order_ids: dict[VenueOrderId, ClientOrderId] = {}
         self._seen_trade_ids: set[TradeId] = set()
@@ -213,9 +220,11 @@ class QMTExecutionClient(LiveExecutionClient):
 
         self._set_account_id(AccountId(f"{client_id.value}-{config.account_id}"))
         self._log.info(f"{config.base_url_http=}", LogColor.BLUE)
+        self._log.info(f"{config.base_url_ws=}", LogColor.BLUE)
         self._log.info(f"{config.account_id=}", LogColor.BLUE)
         self._log.info(f"{config.account_type=}", LogColor.BLUE)
         self._log.info(f"{config.poll_interval_secs=}", LogColor.BLUE)
+        self._log.info(f"{_QMT_USE_TRADING_WEBSOCKET=}", LogColor.BLUE)
 
     async def _connect(self) -> None:
         await self._http_client.connect()
@@ -226,9 +235,17 @@ class QMTExecutionClient(LiveExecutionClient):
         )
         self._session_id = session["session_id"]
         await self._refresh_account_state(force=True)
+        if _QMT_USE_TRADING_WEBSOCKET:
+            self._trading_stream_task = self.create_task(
+                self._stream_trading_events(self._session_id),
+                log_msg="qmt_trading_stream",
+            )
         self._poll_task = self.create_task(self._poll_loop(), log_msg="qmt_execution_poll")
 
     async def _disconnect(self) -> None:
+        if self._trading_stream_task is not None:
+            self._trading_stream_task.cancel()
+            self._trading_stream_task = None
         if self._poll_task is not None:
             self._poll_task.cancel()
             self._poll_task = None
@@ -481,35 +498,46 @@ class QMTExecutionClient(LiveExecutionClient):
         reports = []
         ts_init = self._clock.timestamp_ns()
         for raw_position in await self._http_client.get_positions(self._session_id):
-            instrument_id = qmt_symbol_to_instrument_id(str(raw_position.get("stock_code", "")))
-            if command.instrument_id is not None and instrument_id != command.instrument_id:
+            try:
+                instrument_id = qmt_symbol_to_instrument_id(str(raw_position.get("stock_code", "")))
+                if command.instrument_id is not None and instrument_id != command.instrument_id:
+                    continue
+                volume = int(raw_position.get("volume", 0) or 0)
+                quantity = Quantity.from_int(volume)
+                side = PositionSide.LONG if volume > 0 else PositionSide.FLAT
+                # QMT reports `can_use_volume` (可用数量): the T+1-eligible sellable quantity,
+                # already net of today's buys, frozen, and in-transit shares. Carry it through so
+                # the strategy can size sells against broker ground truth instead of inferring
+                # today's buys from reconciliation-rebuilt fill timestamps.
+                raw_can_use = raw_position.get("can_use_volume")
+                can_use_volume = Decimal(str(raw_can_use)) if raw_can_use is not None else None
+                reports.append(
+                    PositionStatusReport(
+                        account_id=self.account_id,
+                        instrument_id=instrument_id,
+                        position_side=side,
+                        quantity=quantity,
+                        avg_px_open=Decimal(str(raw_position.get("avg_price", "0") or "0")),
+                        can_use_volume=can_use_volume,
+                        report_id=UUID4(),
+                        ts_last=ts_init,
+                        ts_init=ts_init,
+                    ),
+                )
+            except Exception as exc:
+                self._log.error(
+                    "Cannot generate QMT position status report: "
+                    f"{exc}; raw_position={raw_position!r}",
+                )
                 continue
-            volume = int(raw_position.get("volume", 0) or 0)
-            quantity = Quantity.from_int(volume)
-            side = PositionSide.LONG if volume > 0 else PositionSide.FLAT
-            # QMT reports `can_use_volume` (可用数量): the T+1-eligible sellable quantity,
-            # already net of today's buys, frozen, and in-transit shares. Carry it through so
-            # the strategy can size sells against broker ground truth instead of inferring
-            # today's buys from reconciliation-rebuilt fill timestamps.
-            raw_can_use = raw_position.get("can_use_volume")
-            can_use_volume = Decimal(str(raw_can_use)) if raw_can_use is not None else None
-            reports.append(
-                PositionStatusReport(
-                    account_id=self.account_id,
-                    instrument_id=instrument_id,
-                    position_side=side,
-                    quantity=quantity,
-                    avg_px_open=Decimal(str(raw_position.get("avg_price", "0") or "0")),
-                    can_use_volume=can_use_volume,
-                    report_id=UUID4(),
-                    ts_last=ts_init,
-                    ts_init=ts_init,
-                ),
-            )
         return reports
 
     async def _poll_loop(self) -> None:
-        base_interval = self._config.poll_interval_secs
+        base_interval = (
+            max(self._config.poll_interval_secs, _QMT_CALLBACK_FALLBACK_POLL_INTERVAL_SECS)
+            if _QMT_USE_TRADING_WEBSOCKET
+            else self._config.poll_interval_secs
+        )
         max_backoff = 30.0
         failure_streak = 0
         while True:
@@ -542,10 +570,78 @@ class QMTExecutionClient(LiveExecutionClient):
                 failure_streak = 0
             await asyncio.sleep(base_interval)
 
+    async def _stream_trading_events(self, session_id: str) -> None:
+        url = f"{self._ws_base_url}/ws/trading/{session_id}"
+        if self._config.api_key:
+            url = f"{url}?{urlencode({'token': self._config.api_key})}"
+
+        backoff = 1.0
+        max_backoff = 30.0
+        failure_streak = 0
+        while True:
+            try:
+                async with (
+                    aiohttp.ClientSession() as session,
+                    session.ws_connect(url) as ws,
+                ):
+                    if failure_streak:
+                        self._log.info(
+                            "QMT trading stream reconnected "
+                            f"after {failure_streak} failure(s)",
+                        )
+                        failure_streak = 0
+                        backoff = 1.0
+                    await self._consume_trading_ws(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failure_streak += 1
+                if failure_streak == 1 or failure_streak % 30 == 0:
+                    self._log.warning(
+                        f"QMT trading stream failed (streak={failure_streak}): {exc}",
+                    )
+            else:
+                failure_streak += 1
+                if failure_streak == 1:
+                    self._log.warning("QMT trading stream closed; reconnecting")
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    async def _consume_trading_ws(self, ws) -> None:
+        async for message in ws:
+            if message.type == aiohttp.WSMsgType.TEXT:
+                self._dispatch_trading_ws_message(message.json())
+            elif message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                break
+
+    def _dispatch_trading_ws_message(self, payload: dict[str, Any]) -> None:
+        msg_type = payload.get("type")
+        if msg_type == "error":
+            self._log.warning(f"QMT trading stream error message: {payload.get('message')}")
+            return
+        if msg_type != "trading":
+            return
+
+        event = payload.get("data") or {}
+        event_type = event.get("event_type")
+        raw_payload = event.get("payload") or {}
+        if event_type == "order_update":
+            self._handle_order_update(raw_payload)
+        elif event_type == "trade_update":
+            self._handle_trade_update(raw_payload)
+        elif event_type == "asset_update":
+            self._handle_asset_update(raw_payload)
+        elif event_type in {"order_error", "cancel_error"}:
+            self._log.warning(f"QMT trading stream {event_type}: {raw_payload!r}")
+
     async def _refresh_account_state(self, force: bool = False) -> None:
         if self._session_id is None:
             return
         asset = await self._http_client.get_asset(self._session_id)
+        self._handle_asset_update(asset, force=force)
+
+    def _handle_asset_update(self, asset: dict[str, Any], force: bool = False) -> None:
         cash = Decimal(str(asset.get("cash", "0") or "0"))
         frozen_cash = Decimal(str(asset.get("frozen_cash", "0") or "0"))
         # The poll loop runs every poll_interval_secs and the balance is usually

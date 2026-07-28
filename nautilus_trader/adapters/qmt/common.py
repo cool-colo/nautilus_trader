@@ -93,6 +93,41 @@ def bar_type_to_qmt_period(bar_type: BarType) -> str:
     raise ValueError(f"Unsupported QMT bar type: {bar_type}")
 
 
+def qmt_instrument_status(fields: dict[str, object] | None) -> int | None:
+    """
+    Return QMT's ``InstrumentStatus`` (合约停牌状态) from instrument detail fields.
+
+    Returns ``None`` when the field is absent or not parseable as an int.
+    """
+    if not fields:
+        return None
+    raw = fields.get("InstrumentStatus")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def qmt_is_suspended(fields: dict[str, object] | None) -> bool | None:
+    """
+    Return whether the instrument is suspended (停牌) from QMT instrument detail fields.
+
+    Uses xtquant's authoritative rule (``qmttools/contextinfo.py`` ``is_suspended_stock``):
+    ``InstrumentStatus >= 1`` means suspended, ``0`` means trading normally. Returns
+    ``None`` when ``InstrumentStatus`` is unavailable so callers can distinguish
+    "not suspended" from "unknown".
+
+    Note: ``IsTrading`` is deliberately not used — it is a moment-in-time tradability
+    flag that also reads ``False`` for normal stocks outside trading hours.
+    """
+    status = qmt_instrument_status(fields)
+    if status is None:
+        return None
+    return status >= 1
+
+
 def parse_equity(
     symbol: str,
     fields: dict[str, object] | None,
@@ -119,6 +154,10 @@ def parse_equity(
         info={
             "qmt_symbol": qmt_symbol,
             "name": str(name),
+            # Parsed convenience flags so strategies need not re-parse raw QMT
+            # string fields. See qmt_is_suspended for the authoritative rule.
+            "instrument_status": qmt_instrument_status(fields),
+            "is_suspended": qmt_is_suspended(fields),
             "fields": fields,
         },
     )
