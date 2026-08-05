@@ -21,6 +21,7 @@ from nautilus_trader.adapters.bigqmt.client import BigQMTClient
 from nautilus_trader.adapters.bigqmt.common import bar_type_to_qmt_period
 from nautilus_trader.adapters.bigqmt.common import instrument_id_to_bigqmt_symbol
 from nautilus_trader.adapters.bigqmt.common import parse_bar
+from nautilus_trader.adapters.bigqmt.common import parse_full_tick_as_order_book_depth10
 from nautilus_trader.adapters.bigqmt.common import parse_full_tick_as_quote_tick
 from nautilus_trader.adapters.bigqmt.config import BigQMTDataClientConfig
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_VENUE
@@ -35,9 +36,11 @@ from nautilus_trader.data.messages import RequestInstrument
 from nautilus_trader.data.messages import RequestInstruments
 from nautilus_trader.data.messages import SubscribeBars
 from nautilus_trader.data.messages import SubscribeData
+from nautilus_trader.data.messages import SubscribeOrderBook
 from nautilus_trader.data.messages import SubscribeQuoteTicks
 from nautilus_trader.data.messages import UnsubscribeBars
 from nautilus_trader.data.messages import UnsubscribeData
+from nautilus_trader.data.messages import UnsubscribeOrderBook
 from nautilus_trader.data.messages import UnsubscribeQuoteTicks
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import BarType
@@ -114,6 +117,19 @@ class BigQMTDataClient(LiveMarketDataClient):
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         self._cancel_task(("quote", command.instrument_id))
+
+    async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
+        instrument_id = command.instrument_id
+        key = ("depth", instrument_id)
+        task = self.create_task(
+            self._poll_order_book_depth(instrument_id),
+            log_msg=f"bigqmt_depth_poll: {instrument_id}",
+        )
+        if task is not None:
+            self._subscription_tasks[key] = task
+
+    async def _unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
+        self._cancel_task(("depth", command.instrument_id))
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         bar_type = command.bar_type
@@ -192,6 +208,33 @@ class BigQMTDataClient(LiveMarketDataClient):
                 if failure_streak == 1 or failure_streak % 30 == 0:
                     self._log.warning(
                         f"BigQMT quote poll for {instrument_id} failed "
+                        f"(streak={failure_streak}): {exc}",
+                    )
+            await asyncio.sleep(self._config.poll_interval_secs)
+
+    async def _poll_order_book_depth(self, instrument_id: InstrumentId) -> None:
+        symbol = instrument_id_to_bigqmt_symbol(instrument_id)
+        failure_streak = 0
+        while True:
+            try:
+                data = await self._client.get_full_tick([symbol])
+                tick_data = _lookup_symbol(data, symbol)
+                if tick_data:
+                    depth = parse_full_tick_as_order_book_depth10(
+                        instrument_id=instrument_id,
+                        payload=tick_data,
+                        ts_init=self._clock.timestamp_ns(),
+                    )
+                    if depth is not None:
+                        self._handle_data(depth)
+                failure_streak = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failure_streak += 1
+                if failure_streak == 1 or failure_streak % 30 == 0:
+                    self._log.warning(
+                        f"BigQMT depth poll for {instrument_id} failed "
                         f"(streak={failure_streak}): {exc}",
                     )
             await asyncio.sleep(self._config.poll_interval_secs)

@@ -23,6 +23,7 @@ from nautilus_trader.adapters.bigqmt.client import BigQMTClient
 from nautilus_trader.adapters.bigqmt.common import bigqmt_action_to_side
 from nautilus_trader.adapters.bigqmt.common import bigqmt_status_to_order_status
 from nautilus_trader.adapters.bigqmt.common import bigqmt_symbol_to_instrument_id
+from nautilus_trader.adapters.bigqmt.common import bigqmt_traded_at_to_nanos
 from nautilus_trader.adapters.bigqmt.common import instrument_id_to_bigqmt_symbol
 from nautilus_trader.adapters.bigqmt.common import millis_to_nanos
 from nautilus_trader.adapters.bigqmt.common import qmt_order_type_from_price_type
@@ -674,7 +675,11 @@ class BigQMTExecutionClient(LiveExecutionClient):
             commission=Money(commission, CNY),
             liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
             report_id=UUID4(),
-            ts_event=millis_to_nanos(raw_trade.get("traded_time_ms")) or self._clock.timestamp_ns(),
+            ts_event=(
+                bigqmt_traded_at_to_nanos(raw_trade.get("traded_at"))
+                or millis_to_nanos(raw_trade.get("traded_time_ms"))
+                or self._clock.timestamp_ns()
+            ),
             ts_init=self._clock.timestamp_ns(),
         )
 
