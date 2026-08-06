@@ -17,6 +17,7 @@ import asyncio
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_VENUE
 from nautilus_trader.adapters.bigqmt.execution import BigQMTExecutionClient
@@ -27,8 +28,13 @@ from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
+from nautilus_trader.model.identifiers import TradeId
+from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Quantity
 
 
 INSTRUMENT_ID = InstrumentId(symbol=Symbol("000001.SZ"), venue=BIG_QMT_VENUE)
@@ -43,17 +49,24 @@ class _FakeClock:
 
 
 class _FakeClient:
-    def __init__(self, positions=()):
+    def __init__(self, positions=(), submit_response=None):
         self._positions = list(positions)
+        self._submit_response = submit_response or {}
+        self.submit_calls = []
 
     async def get_positions(self):
         return self._positions
+
+    async def submit_order(self, **kwargs):
+        self.submit_calls.append(kwargs)
+        return self._submit_response
 
 
 class _FakeLog:
     def __init__(self):
         self.errors = []
         self.warnings = []
+        self.infos = []
 
     def error(self, message):
         self.errors.append(message)
@@ -61,19 +74,82 @@ class _FakeLog:
     def warning(self, message):
         self.warnings.append(message)
 
+    def info(self, message):
+        self.infos.append(message)
+
+
+class _FakeCache:
+    def __init__(self, orders):
+        self._orders = orders
+
+    def order(self, client_order_id):
+        return self._orders.get(client_order_id)
+
 
 class _StubExecClient:
     account_id = AccountId("BIGQMT-TEST")
     _clock = _FakeClock()
 
+    _handle_asset_update = BigQMTExecutionClient._handle_asset_update
+    _handle_order_update = BigQMTExecutionClient._handle_order_update
+    _handle_terminal_order_update = BigQMTExecutionClient._handle_terminal_order_update
+    _handle_trade_update = BigQMTExecutionClient._handle_trade_update
     _parse_order_status_report = BigQMTExecutionClient._parse_order_status_report
     _parse_fill_report = BigQMTExecutionClient._parse_fill_report
+    _resolve_client_order_id = BigQMTExecutionClient._resolve_client_order_id
     _order_side = BigQMTExecutionClient._order_side
+    _order_price = BigQMTExecutionClient._order_price
+    _submit_nautilus_order = BigQMTExecutionClient._submit_nautilus_order
     generate_position_status_reports = BigQMTExecutionClient.generate_position_status_reports
 
-    def __init__(self, positions=()):
-        self._client = _FakeClient(positions)
+    def __init__(self, positions=(), submit_response=None):
+        self._client = _FakeClient(positions, submit_response)
         self._log = _FakeLog()
+        self._config = SimpleNamespace(
+            default_limit_price_type=11,
+            default_market_price_type=5,
+            enforce_sellable_position=False,
+            strategy_name="test",
+        )
+        self._last_account_key = None
+        self._known_order_status = {}
+        self._known_client_order_ids = {}
+        self._seen_trade_ids = set()
+        self._terminal_events = set()
+        self._orders = {}
+        self._cache = _FakeCache(self._orders)
+        self.account_states = []
+        self.submitted = []
+        self.accepted = []
+        self.rejected = []
+        self.filled = []
+
+    def generate_account_state(self, **kwargs):
+        self.account_states.append(kwargs)
+
+    def generate_order_submitted(self, **kwargs):
+        self.submitted.append(kwargs)
+
+    def generate_order_accepted(self, **kwargs):
+        self.accepted.append(kwargs)
+
+    def generate_order_rejected(self, **kwargs):
+        self.rejected.append(kwargs)
+
+    def generate_order_filled(self, **kwargs):
+        self.filled.append(kwargs)
+
+
+def _test_order(client_order_id="O-1"):
+    return SimpleNamespace(
+        strategy_id="S-1",
+        instrument_id=INSTRUMENT_ID,
+        client_order_id=ClientOrderId(client_order_id),
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=Quantity.from_int(100),
+        price=Price.from_str("10.00"),
+    )
 
 
 def test_parse_order_status_report_maps_bigqmt_fields():
@@ -109,7 +185,9 @@ def test_parse_order_status_report_drops_zero_volume():
 
 
 def test_parse_fill_report_maps_bigqmt_fields():
-    report = _StubExecClient()._parse_fill_report(
+    client = _StubExecClient()
+
+    report = client._parse_fill_report(
         {
             "stock_code": "000001.SZ",
             "order_sysid": "7788",
@@ -139,6 +217,157 @@ def test_order_side_prefers_action_then_order_type():
     assert client._order_side({"action": "SELL", "order_type": 23}) == OrderSide.SELL
     assert client._order_side({"order_type": 24}) == OrderSide.SELL
     assert client._order_side({"order_type": 23}) == OrderSide.BUY
+
+
+def test_asset_update_republishes_when_valuation_changes():
+    client = _StubExecClient()
+    initial_asset = {
+        "cash": "100.00",
+        "frozen_cash": "10.00",
+        "total_asset": "1000.00",
+        "market_value": "890.00",
+    }
+    changed_valuation = {**initial_asset, "total_asset": "1001.00", "market_value": "891.00"}
+
+    client._handle_asset_update(initial_asset)
+    client._handle_asset_update(changed_valuation)
+    client._handle_asset_update(changed_valuation)
+
+    assert len(client.account_states) == 2
+    assert client.account_states[-1]["info"] == changed_valuation
+
+
+def test_submit_keeps_order_submitted_when_passorder_is_asynchronous():
+    client = _StubExecClient(
+        submit_response={
+            "status": "SUBMITTED",
+            "user_order_id": "O-1",
+            "order_sys_id": None,
+            "message": "passorder submitted",
+        },
+    )
+    order = _test_order()
+
+    asyncio.run(client._submit_nautilus_order(order))
+
+    assert len(client.submitted) == 1
+    assert client.accepted == []
+    assert client.rejected == []
+    assert client._client.submit_calls[0]["order_remark"] == "O-1"
+    assert client._known_client_order_ids == {}
+
+
+def test_order_callback_without_remark_does_not_block_later_poll_correlation():
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+    venue_order_id = VenueOrderId("7788")
+
+    client._handle_order_update({"order_sysid": "7788", "order_status": 50})
+
+    assert client._known_order_status == {}
+    assert client.accepted == []
+
+    client._handle_order_update(
+        {"order_sysid": "7788", "order_status": 50, "order_remark": "O-1"},
+    )
+
+    assert client._known_order_status[venue_order_id] == OrderStatus.ACCEPTED
+    assert client._known_client_order_ids[venue_order_id] == order.client_order_id
+    assert len(client.accepted) == 1
+
+
+def test_order_callback_ignores_client_order_id_used_as_temporary_order_id():
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+
+    client._handle_order_update(
+        {
+            "order_sysid": "O-1",
+            "order_id": "O-1",
+            "order_remark": "O-1",
+            "order_status": 50,
+        },
+    )
+
+    assert client._known_order_status == {}
+    assert client._known_client_order_ids == {}
+    assert client.accepted == []
+
+    client._handle_order_update(
+        {
+            "order_sysid": "1707",
+            "order_id": "1707",
+            "order_remark": "O-1",
+            "order_status": 50,
+        },
+    )
+
+    venue_order_id = VenueOrderId("1707")
+    assert client._known_order_status[venue_order_id] == OrderStatus.ACCEPTED
+    assert client._known_client_order_ids[venue_order_id] == order.client_order_id
+    assert client.accepted[0]["venue_order_id"] == venue_order_id
+
+
+def test_parse_order_status_report_drops_temporary_client_order_id():
+    report = _StubExecClient()._parse_order_status_report(
+        {
+            "order_sysid": "O-1",
+            "order_id": "O-1",
+            "order_remark": "O-1",
+            "stock_code": "000001.SZ",
+            "order_volume": 100,
+        },
+    )
+
+    assert report is None
+
+
+def test_trade_callback_without_remark_can_be_recovered_by_later_poll():
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+    raw_trade = {
+        "stock_code": "000001.SZ",
+        "order_sysid": "7788",
+        "trade_id": "T-42",
+        "action": "BUY",
+        "traded_volume": 100,
+        "traded_price": 11.5,
+    }
+
+    client._handle_trade_update(raw_trade)
+
+    assert client._seen_trade_ids == set()
+    assert client.filled == []
+
+    client._handle_trade_update({**raw_trade, "order_remark": "O-1"})
+
+    assert client._seen_trade_ids == {TradeId("T-42")}
+    assert len(client.filled) == 1
+
+
+def test_trade_callback_rejects_source_instrument_without_exchange_suffix():
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+
+    client._handle_trade_update(
+        {
+            "stock_code": "000001",
+            "order_sysid": "7788",
+            "order_remark": "O-1",
+            "trade_id": "T-42",
+            "action": "BUY",
+            "traded_volume": 100,
+            "traded_price": 11.5,
+        },
+    )
+
+    assert client.filled == []
+    assert len(client._log.errors) == 1
+    assert "source stock_code must include a supported exchange suffix" in client._log.errors[0]
 
 
 def test_generate_position_status_reports_skips_invalid_quantity():

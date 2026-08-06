@@ -82,6 +82,28 @@ _BIG_QMT_OPEN_ORDER_STATUSES = {
 }
 
 
+def _client_order_id_value(raw: dict[str, Any]) -> str:
+    return str(
+        raw.get("order_remark")
+        or raw.get("client_order_id")
+        or raw.get("user_order_id")
+        or raw.get("remark")
+        or "",
+    )
+
+
+def _venue_order_id_value(raw: dict[str, Any]) -> str:
+    # BigQmtXtTrader uses user_order_id as a temporary ``order_id`` until QMT
+    # supplies an order_sys_id. Event normalization can propagate that placeholder
+    # into ``order_sysid`` too, so validate every candidate against the client ID.
+    client_order_id = _client_order_id_value(raw)
+    for key in ("order_sysid", "order_sys_id", "order_id"):
+        venue_order_id = str(raw.get(key) or "")
+        if venue_order_id and venue_order_id != client_order_id:
+            return venue_order_id
+    return ""
+
+
 class _BigQMTTraderCallback:
     """
     Adapter between the Big QMT ``XtQuantTraderCallback`` protocol and the
@@ -159,7 +181,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
         self._known_client_order_ids: dict[VenueOrderId, ClientOrderId] = {}
         self._seen_trade_ids: set[TradeId] = set()
         self._terminal_events: set[VenueOrderId] = set()
-        self._last_account_key: tuple[Decimal, Decimal] | None = None
+        self._last_account_key: tuple[Decimal, Decimal, Decimal, Decimal] | None = None
 
         self._set_account_id(AccountId(f"{client_id.value}-{config.account_id}"))
         self._log.info(f"{config.redis_host=}", LogColor.BLUE)
@@ -263,6 +285,20 @@ class BigQMTExecutionClient(LiveExecutionClient):
 
         order_sys_id = str(response.get("order_sys_id") or response.get("order_sysid") or "")
         if not order_sys_id or order_sys_id == "-1":
+            # ``passorder`` is asynchronous in the QMT strategy runtime.  The bridge
+            # acknowledges a successfully handed-off request as SUBMITTED, but the
+            # broker order system ID is only available from a later callback/poll.
+            # Keep Nautilus in Submitted until that correlation arrives; rejecting
+            # here could cause a strategy retry after QMT has already placed the order.
+            if (
+                str(response.get("status") or "").upper() == "SUBMITTED"
+                and str(response.get("user_order_id") or "") == order.client_order_id.value
+            ):
+                self._log.info(
+                    f"BigQMT order submitted asynchronously, awaiting venue order ID: "
+                    f"{order.client_order_id}",
+                )
+                return
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
@@ -468,7 +504,9 @@ class BigQMTExecutionClient(LiveExecutionClient):
     def _handle_asset_update(self, asset: dict[str, Any], force: bool = False) -> None:
         cash = Decimal(str(asset.get("cash", "0") or "0"))
         frozen_cash = Decimal(str(asset.get("frozen_cash", "0") or "0"))
-        account_key = (cash, frozen_cash)
+        total_asset = Decimal(str(asset.get("total_asset", "0") or "0"))
+        market_value = Decimal(str(asset.get("market_value", "0") or "0"))
+        account_key = (cash, frozen_cash, total_asset, market_value)
         if not force and account_key == self._last_account_key:
             return
         self._last_account_key = account_key
@@ -487,16 +525,16 @@ class BigQMTExecutionClient(LiveExecutionClient):
         )
 
     def _handle_order_update(self, raw_order: dict[str, Any]) -> None:
-        venue_order_id_value = str(
-            raw_order.get("order_sysid")
-            or raw_order.get("order_sys_id")
-            or raw_order.get("order_id")
-            or "",
-        )
+        venue_order_id_value = _venue_order_id_value(raw_order)
         if not venue_order_id_value:
             return
         venue_order_id = VenueOrderId(venue_order_id_value)
         client_order_id = self._resolve_client_order_id(venue_order_id, raw_order)
+        if client_order_id is None:
+            return
+        order = self._cache.order(client_order_id)
+        if order is None:
+            return
 
         status = bigqmt_status_to_order_status(
             raw_order.get("order_status", raw_order.get("status")),
@@ -505,12 +543,6 @@ class BigQMTExecutionClient(LiveExecutionClient):
         if previous_status == status:
             return
         self._known_order_status[venue_order_id] = status
-
-        if client_order_id is None:
-            return
-        order = self._cache.order(client_order_id)
-        if order is None:
-            return
 
         ts_event = self._clock.timestamp_ns()
         if status == OrderStatus.PENDING_CANCEL:
@@ -571,9 +603,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
         venue_order_id: VenueOrderId,
         raw_order: dict[str, Any],
     ) -> ClientOrderId | None:
-        client_order_id_value = str(
-            raw_order.get("order_remark") or raw_order.get("client_order_id") or "",
-        )
+        client_order_id_value = _client_order_id_value(raw_order)
         if client_order_id_value:
             client_order_id = ClientOrderId(client_order_id_value)
             self._known_client_order_ids[venue_order_id] = client_order_id
@@ -582,9 +612,8 @@ class BigQMTExecutionClient(LiveExecutionClient):
 
     def _handle_trade_update(self, raw_trade: dict[str, Any]) -> None:
         report = self._parse_fill_report(raw_trade)
-        if report is None or report.trade_id in self._seen_trade_ids:
+        if report is None:
             return
-        self._seen_trade_ids.add(report.trade_id)
         client_order_id = report.client_order_id
         if client_order_id is None and report.venue_order_id is not None:
             client_order_id = self._known_client_order_ids.get(report.venue_order_id)
@@ -593,6 +622,9 @@ class BigQMTExecutionClient(LiveExecutionClient):
         order = self._cache.order(client_order_id)
         if order is None:
             return
+        if report.trade_id in self._seen_trade_ids:
+            return
+        self._seen_trade_ids.add(report.trade_id)
         self.generate_order_filled(
             strategy_id=order.strategy_id,
             instrument_id=report.instrument_id,
@@ -611,14 +643,10 @@ class BigQMTExecutionClient(LiveExecutionClient):
         )
 
     def _parse_order_status_report(self, raw_order: dict[str, Any]) -> OrderStatusReport | None:
-        venue_order_id_value = str(
-            raw_order.get("order_sysid") or raw_order.get("order_id") or "",
-        )
+        venue_order_id_value = _venue_order_id_value(raw_order)
         if not venue_order_id_value:
             return None
-        client_order_id_value = str(
-            raw_order.get("order_remark") or raw_order.get("client_order_id") or "",
-        )
+        client_order_id_value = _client_order_id_value(raw_order)
         client_order_id = ClientOrderId(client_order_id_value) if client_order_id_value else None
         price = Decimal(str(raw_order.get("price", "0") or "0"))
         order_volume = int(raw_order.get("order_volume", 0) or 0)
@@ -650,14 +678,29 @@ class BigQMTExecutionClient(LiveExecutionClient):
 
     def _parse_fill_report(self, raw_trade: dict[str, Any]) -> FillReport | None:
         trade_id_value = str(raw_trade.get("trade_id") or raw_trade.get("traded_id") or "")
-        venue_order_id_value = str(
-            raw_trade.get("order_sysid") or raw_trade.get("order_sys_id") or raw_trade.get("order_id") or "",
-        )
+        venue_order_id_value = _venue_order_id_value(raw_trade)
         if not trade_id_value or not venue_order_id_value:
             return None
-        client_order_id_value = str(
-            raw_trade.get("order_remark") or raw_trade.get("client_order_id") or "",
-        )
+        client_order_id_value = _client_order_id_value(raw_trade)
+        if not client_order_id_value:
+            self._log.error(
+                f"Cannot parse BigQMT fill {trade_id_value}: missing client order ID; "
+                f"raw_trade={raw_trade!r}",
+            )
+            return None
+
+        venue_order_id = VenueOrderId(venue_order_id_value)
+        client_order_id = ClientOrderId(client_order_id_value)
+        stock_code = str(raw_trade.get("stock_code") or "").strip().upper()
+        symbol_parts = stock_code.rsplit(".", maxsplit=1)
+        if len(symbol_parts) != 2 or not symbol_parts[0] or symbol_parts[1] not in {"SH", "SZ", "BJ"}:
+            self._log.error(
+                f"Cannot parse BigQMT fill {trade_id_value}: source stock_code must include "
+                f"a supported exchange suffix, got {stock_code!r}; raw_trade={raw_trade!r}",
+            )
+            return None
+
+        instrument_id = bigqmt_symbol_to_instrument_id(stock_code)
         price = Decimal(str(raw_trade.get("traded_price", raw_trade.get("price", "0")) or "0"))
         volume = int(raw_trade.get("traded_volume", raw_trade.get("volume", 0)) or 0)
         if price <= 0 or volume <= 0:
@@ -665,10 +708,10 @@ class BigQMTExecutionClient(LiveExecutionClient):
         commission = Decimal(str(raw_trade.get("commission", "0") or "0"))
         return FillReport(
             account_id=self.account_id,
-            instrument_id=bigqmt_symbol_to_instrument_id(str(raw_trade.get("stock_code", ""))),
-            venue_order_id=VenueOrderId(venue_order_id_value),
+            instrument_id=instrument_id,
+            venue_order_id=venue_order_id,
             trade_id=TradeId(trade_id_value),
-            client_order_id=ClientOrderId(client_order_id_value) if client_order_id_value else None,
+            client_order_id=client_order_id,
             order_side=self._order_side(raw_trade),
             last_qty=Quantity.from_int(volume),
             last_px=Price.from_str(f"{price:.2f}"),
