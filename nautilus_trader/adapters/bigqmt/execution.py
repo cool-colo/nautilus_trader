@@ -544,7 +544,9 @@ class BigQMTExecutionClient(LiveExecutionClient):
             return
         self._known_order_status[venue_order_id] = status
 
-        ts_event = self._clock.timestamp_ns()
+        # Prefer QMT's recorded委托时间 (m_strInsertDate+Time, normalized to order_at)
+        # over the local receive clock, so the persisted order_time is authoritative.
+        ts_event = bigqmt_traded_at_to_nanos(raw_order.get("order_at")) or self._clock.timestamp_ns()
         if status == OrderStatus.PENDING_CANCEL:
             return
 
@@ -640,6 +642,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
             commission=report.commission,
             liquidity_side=report.liquidity_side,
             ts_event=report.ts_event,
+            info=raw_trade,
         )
 
     def _parse_order_status_report(self, raw_order: dict[str, Any]) -> OrderStatusReport | None:

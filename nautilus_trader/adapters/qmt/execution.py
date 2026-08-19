@@ -769,6 +769,7 @@ class QMTExecutionClient(LiveExecutionClient):
             commission=report.commission,
             liquidity_side=report.liquidity_side,
             ts_event=report.ts_event,
+            info=raw_trade,
         )
 
     def _parse_order_status_report(self, raw_order: dict[str, Any]) -> OrderStatusReport | None:
