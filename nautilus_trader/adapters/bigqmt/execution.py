@@ -129,10 +129,12 @@ class _BigQMTTraderCallback:
         self._loop.call_soon_threadsafe(self._client._handle_trade_update, raw)
 
     def on_order_error(self, order_error: Any) -> None:
-        pass
+        raw = order_error if isinstance(order_error, dict) else dict(vars(order_error))
+        self._loop.call_soon_threadsafe(self._client._handle_order_error, raw)
 
     def on_cancel_error(self, cancel_error: Any) -> None:
-        pass
+        raw = cancel_error if isinstance(cancel_error, dict) else dict(vars(cancel_error))
+        self._loop.call_soon_threadsafe(self._client._handle_cancel_error, raw)
 
     def on_order_stock_async_response(self, response: Any) -> None:
         pass
@@ -198,7 +200,10 @@ class BigQMTExecutionClient(LiveExecutionClient):
         callback = _BigQMTTraderCallback(self, self._loop)
         self._client.register_callback(callback)
         await self._refresh_account_state(force=True)
-        self._poll_task = self.create_task(self._poll_loop(), log_msg="bigqmt_execution_poll")
+        if self._config.poll_enabled:
+            self._poll_task = self.create_task(self._poll_loop(), log_msg="bigqmt_execution_poll")
+        else:
+            self._log.info("BigQMT execution poll loop disabled (poll_enabled=False)", LogColor.BLUE)
 
     async def _disconnect(self) -> None:
         if self._poll_task is not None:
@@ -599,6 +604,85 @@ class BigQMTExecutionClient(LiveExecutionClient):
                 ts_event=ts_event,
             )
             self._terminal_events.add(venue_order_id)
+
+    def _resolve_error_ids(
+        self,
+        raw: dict[str, Any],
+    ) -> tuple[VenueOrderId | None, ClientOrderId | None, Any]:
+        """
+        Resolve (venue_order_id, client_order_id, order) for an error event.
+
+        Error events carry ``order_remark``/``user_order_id`` (client id) and
+        ``order_sys_id`` (venue id). The client id may be missing (e.g. the
+        counter rejected before an order-sys-id was assigned), in which case we
+        fall back to the venue-id → client-id map populated by order/trade
+        updates. Returns ``(None, None, None)`` when no cached order matches.
+        """
+        venue_order_id_value = _venue_order_id_value(raw)
+        venue_order_id = VenueOrderId(venue_order_id_value) if venue_order_id_value else None
+
+        client_order_id_value = _client_order_id_value(raw)
+        client_order_id: ClientOrderId | None = None
+        if client_order_id_value:
+            client_order_id = ClientOrderId(client_order_id_value)
+        elif venue_order_id is not None:
+            client_order_id = self._known_client_order_ids.get(venue_order_id)
+
+        if client_order_id is None:
+            return None, None, None
+        order = self._cache.order(client_order_id)
+        if order is None:
+            return venue_order_id, client_order_id, None
+        return venue_order_id, client_order_id, order
+
+    def _handle_order_error(self, raw: dict[str, Any]) -> None:
+        venue_order_id, client_order_id, order = self._resolve_error_ids(raw)
+        if order is None:
+            self._log.warning(
+                f"Ignoring BigQMT order_error with no cached order; raw={raw!r}",
+            )
+            return
+        # Dedup against the same two sets the poll loop writes so a status-57
+        # reject arriving via either path is emitted exactly once.
+        if venue_order_id is not None:
+            if venue_order_id in self._terminal_events:
+                return
+            self._known_order_status[venue_order_id] = OrderStatus.REJECTED
+            self._terminal_events.add(venue_order_id)
+        reason = str(raw.get("error_msg") or raw.get("status_msg") or "BigQMT order rejected")
+        self.generate_order_rejected(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=client_order_id,
+            reason=reason,
+            ts_event=self._clock.timestamp_ns(),
+        )
+
+    def _handle_cancel_error(self, raw: dict[str, Any]) -> None:
+        venue_order_id, client_order_id, order = self._resolve_error_ids(raw)
+        if order is None:
+            self._log.warning(
+                f"Ignoring BigQMT cancel_error with no cached order; raw={raw!r}",
+            )
+            return
+        if venue_order_id is None:
+            venue_order_id = order.venue_order_id
+        if venue_order_id is None:
+            self._log.warning(
+                f"Ignoring BigQMT cancel_error with no venue order ID; raw={raw!r}",
+            )
+            return
+        # A cancel rejection is not a terminal order event (the order lives on),
+        # so we do NOT touch _terminal_events / _known_order_status here.
+        reason = str(raw.get("error_msg") or raw.get("status_msg") or "BigQMT cancel rejected")
+        self.generate_order_cancel_rejected(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            reason=reason,
+            ts_event=self._clock.timestamp_ns(),
+        )
 
     def _resolve_client_order_id(
         self,

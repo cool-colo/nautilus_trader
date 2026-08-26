@@ -44,12 +44,21 @@ class BigQMTDataClientConfig(LiveDataClientConfig, frozen=True):
         RPC transport ("redis", "zmq" or "mysql").
     rpc_timeout_secs : PositiveFloat, default 6.0
         RPC request timeout.
-    poll_interval_secs : PositiveFloat, default 3.0
-        Poll interval for market-data polling fallback.
+    poll_interval_secs : PositiveFloat, default 60.0
+        Poll interval for the market-data polling fallback. Since the
+        ``subscribe_whole_quote`` push feed is the primary source, polling only
+        acts as a slow backstop; set lower if running with ``use_quote_push=False``.
     instrument_provider : BigQMTInstrumentProviderConfig, optional
         Instrument loading configuration.
     adjust_type : str, default "none"
         Big QMT dividend adjustment mode used for historical data requests.
+    use_quote_push : bool, default True
+        If True, quote/depth subscriptions use the service's ``subscribe_whole_quote``
+        push feed when available. Set False to force polling (e.g. against an older
+        service without push support).
+    poll_enabled : bool, default True
+        If True, keeps the market-data poll loop running as a fallback alongside
+        the push feed. Set False to rely solely on the push feed.
     """
 
     account_id: str = ""
@@ -59,10 +68,12 @@ class BigQMTDataClientConfig(LiveDataClientConfig, frozen=True):
     redis_password: str | None = None
     transport: str = "redis"
     rpc_timeout_secs: PositiveFloat = 6.0
-    poll_interval_secs: PositiveFloat = 3.0
+    poll_interval_secs: PositiveFloat = 60.0
     venue: Venue = BIG_QMT_VENUE
     instrument_provider: BigQMTInstrumentProviderConfig | None = None
     adjust_type: str = "none"
+    use_quote_push: bool = True
+    poll_enabled: bool = True
 
 
 class BigQMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
@@ -97,6 +108,10 @@ class BigQMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
         Strategy name recorded on submitted orders.
     enforce_sellable_position : bool, default True
         If True, validates SELL orders against Big QMT ``can_use_volume`` before submitting.
+    poll_enabled : bool, default True
+        If True, runs the order/trade/asset reconcile poll loop as a fallback
+        alongside the real-time callback feed. Set False to rely solely on the
+        push callbacks (on-demand report queries still work).
     """
 
     account_id: str
@@ -112,5 +127,6 @@ class BigQMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
     default_limit_price_type: PositiveInt = BIG_QMT_PRICE_TYPE_FIX_PRICE
     strategy_name: str = "nautilus"
     enforce_sellable_position: bool = True
+    poll_enabled: bool = True
     venue: Venue = BIG_QMT_VENUE
     instrument_provider: BigQMTInstrumentProviderConfig | None = None

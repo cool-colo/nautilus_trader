@@ -93,6 +93,9 @@ class _StubExecClient:
     _handle_asset_update = BigQMTExecutionClient._handle_asset_update
     _handle_order_update = BigQMTExecutionClient._handle_order_update
     _handle_terminal_order_update = BigQMTExecutionClient._handle_terminal_order_update
+    _handle_order_error = BigQMTExecutionClient._handle_order_error
+    _handle_cancel_error = BigQMTExecutionClient._handle_cancel_error
+    _resolve_error_ids = BigQMTExecutionClient._resolve_error_ids
     _handle_trade_update = BigQMTExecutionClient._handle_trade_update
     _parse_order_status_report = BigQMTExecutionClient._parse_order_status_report
     _parse_fill_report = BigQMTExecutionClient._parse_fill_report
@@ -122,6 +125,7 @@ class _StubExecClient:
         self.submitted = []
         self.accepted = []
         self.rejected = []
+        self.cancel_rejected = []
         self.filled = []
 
     def generate_account_state(self, **kwargs):
@@ -135,6 +139,9 @@ class _StubExecClient:
 
     def generate_order_rejected(self, **kwargs):
         self.rejected.append(kwargs)
+
+    def generate_order_cancel_rejected(self, **kwargs):
+        self.cancel_rejected.append(kwargs)
 
     def generate_order_filled(self, **kwargs):
         self.filled.append(kwargs)
@@ -394,3 +401,126 @@ def test_generate_position_status_reports_skips_invalid_quantity():
     assert reports[0].can_use_volume == Decimal(100)
     assert len(client._log.errors) == 1
     assert "Cannot generate BigQMT position status report" in client._log.errors[0]
+
+
+def test_order_error_emits_rejected_with_counter_reason():
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+    raw = {
+        "stock_code": "000001.SZ",
+        "order_sys_id": "7788",
+        "order_remark": "O-1",
+        "error_id": 1,
+        "error_msg": "[COUNTER] 资金可用余额不足，尚需100.00",  # noqa: RUF001
+    }
+
+    client._handle_order_error(raw)
+
+    assert len(client.rejected) == 1
+    assert client.rejected[0]["client_order_id"] == order.client_order_id
+    assert "资金可用余额不足" in client.rejected[0]["reason"]
+    assert client._known_order_status[VenueOrderId("7788")] == OrderStatus.REJECTED
+    assert VenueOrderId("7788") in client._terminal_events
+
+
+def test_order_error_dedupes_against_poll_loop_terminal_event():
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+    venue_order_id = VenueOrderId("7788")
+
+    # The poll loop already emitted the reject via a status-57 terminal update.
+    client._handle_terminal_order_update(
+        order,
+        {"order_sysid": "7788", "order_remark": "O-1", "status_msg": "rejected"},
+        venue_order_id,
+        order.client_order_id,
+        OrderStatus.REJECTED,
+        123,
+    )
+
+    client._handle_order_error(
+        {
+            "stock_code": "000001.SZ",
+            "order_sys_id": "7788",
+            "order_remark": "O-1",
+            "error_msg": "rejected",
+        },
+    )
+
+    assert len(client.rejected) == 1  # from the poll path only; push deduped
+
+
+def test_order_error_without_remark_uses_known_client_order_id_map():
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+    client._known_client_order_ids[VenueOrderId("7788")] = order.client_order_id
+
+    client._handle_order_error(
+        {
+            "stock_code": "000001.SZ",
+            "order_sys_id": "7788",
+            "error_msg": "rejected",
+        },
+    )
+
+    assert len(client.rejected) == 1
+    assert client.rejected[0]["client_order_id"] == order.client_order_id
+
+
+def test_order_error_without_cached_order_is_ignored():
+    client = _StubExecClient()
+
+    client._handle_order_error(
+        {
+            "stock_code": "000001.SZ",
+            "order_sys_id": "7788",
+            "order_remark": "O-unknown",
+            "error_msg": "rejected",
+        },
+    )
+
+    assert client.rejected == []
+    assert len(client._log.warnings) == 1
+    assert "no cached order" in client._log.warnings[0]
+
+
+def test_cancel_error_emits_cancel_rejected():
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+    raw = {
+        "stock_code": "000001.SZ",
+        "order_sys_id": "7788",
+        "order_remark": "O-1",
+        "error_msg": "撤单失败，订单已成交",  # noqa: RUF001
+    }
+
+    client._handle_cancel_error(raw)
+
+    assert len(client.cancel_rejected) == 1
+    assert client.cancel_rejected[0]["client_order_id"] == order.client_order_id
+    assert client.cancel_rejected[0]["venue_order_id"] == VenueOrderId("7788")
+    assert "撤单失败" in client.cancel_rejected[0]["reason"]
+    # A cancel rejection is not terminal; order state untouched.
+    assert VenueOrderId("7788") not in client._terminal_events
+    assert client._known_order_status == {}
+
+
+def test_cancel_error_without_cache_or_known_ids_is_ignored():
+    client = _StubExecClient()
+
+    client._handle_cancel_error(
+        {
+            "stock_code": "000001.SZ",
+            "order_sys_id": "7788",
+            "order_remark": "O-unknown",
+            "error_msg": "撤单失败",
+        },
+    )
+
+    assert client.cancel_rejected == []
+    assert len(client._log.warnings) == 1
+    assert "no cached order" in client._log.warnings[0]

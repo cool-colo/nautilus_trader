@@ -149,6 +149,30 @@ class BigQMTClient:
     async def get_full_tick(self, code_list: list[str]) -> dict[str, Any]:
         return await self._run(self._xtdata.get_full_tick, code_list) or {}
 
+    def is_quote_push_supported(self) -> bool:
+        """
+        Return True if the connected service exposes the whole-quote push API.
+        """
+        xtdata = self._xtdata
+        return xtdata is not None and hasattr(xtdata, "subscribe_whole_quote")
+
+    async def subscribe_whole_quote(
+        self,
+        code_list: list[str],
+        callback: Callable[[dict[str, Any]], None],
+    ) -> int:
+        """
+        Subscribe to the whole-quote push feed for ``code_list``; returns a sub id.
+
+        The service primes ``callback`` once with a full-tick snapshot (invoked on
+        the calling thread) and then pushes incremental ``{code: {field: value}}``
+        batches on its own subscriber thread.
+        """
+        return await self._run(self._xtdata.subscribe_whole_quote, list(code_list), callback)
+
+    async def unsubscribe_whole_quote(self, sub_id: int) -> int:
+        return await self._run(self._xtdata.unsubscribe_quote, sub_id)
+
     async def get_market_data_ex(
         self,
         stock_list: list[str],

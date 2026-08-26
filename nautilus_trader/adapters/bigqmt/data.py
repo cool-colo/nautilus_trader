@@ -19,6 +19,7 @@ import asyncio
 
 from nautilus_trader.adapters.bigqmt.client import BigQMTClient
 from nautilus_trader.adapters.bigqmt.common import bar_type_to_qmt_period
+from nautilus_trader.adapters.bigqmt.common import bigqmt_symbol_to_instrument_id
 from nautilus_trader.adapters.bigqmt.common import instrument_id_to_bigqmt_symbol
 from nautilus_trader.adapters.bigqmt.common import parse_bar
 from nautilus_trader.adapters.bigqmt.common import parse_full_tick_as_order_book_depth10
@@ -82,21 +83,51 @@ class BigQMTDataClient(LiveMarketDataClient):
         self._config = config
         self._subscription_tasks: dict[object, asyncio.Task] = {}
 
+        # Whole-quote push state. ``_push_codes`` is the union of bigqmt symbol
+        # strings wanted by quote+depth subscribers; ``_push_sub_id`` is the
+        # current session subscription covering that union (re-created on change).
+        # ``_push_quote_ids`` / ``_push_depth_ids`` route an incoming push to the
+        # right converter(s) per instrument.
+        self._quote_push_supported = False
+        self._push_codes: set[str] = set()
+        self._push_sub_id: int | None = None
+        self._push_quote_ids: set[InstrumentId] = set()
+        self._push_depth_ids: set[InstrumentId] = set()
+
         self._log.info(f"{config.redis_host=}", LogColor.BLUE)
         self._log.info(f"{config.redis_port=}", LogColor.BLUE)
         self._log.info(f"{config.transport=}", LogColor.BLUE)
         self._log.info(f"{config.poll_interval_secs=}", LogColor.BLUE)
         self._log.info(f"{config.adjust_type=}", LogColor.BLUE)
+        self._log.info(f"{config.use_quote_push=}", LogColor.BLUE)
+        self._log.info(f"{config.poll_enabled=}", LogColor.BLUE)
 
     async def _connect(self) -> None:
         await self._client.connect()
         await self._instrument_provider.initialize()
         self._send_all_instruments_to_data_engine()
+        self._quote_push_supported = bool(
+            self._config.use_quote_push and self._client.is_quote_push_supported(),
+        )
+        if self._config.use_quote_push and not self._quote_push_supported:
+            self._log.warning(
+                "BigQMT service does not support whole-quote push; falling back to polling",
+            )
+        self._log.info(f"{self._quote_push_supported=}", LogColor.BLUE)
 
     async def _disconnect(self) -> None:
         for task in list(self._subscription_tasks.values()):
             task.cancel()
         self._subscription_tasks.clear()
+        if self._push_sub_id is not None:
+            try:
+                await self._client.unsubscribe_whole_quote(self._push_sub_id)
+            except Exception as exc:
+                self._log.warning(f"BigQMT whole-quote unsubscribe failed on disconnect: {exc}")
+            self._push_sub_id = None
+        self._push_codes.clear()
+        self._push_quote_ids.clear()
+        self._push_depth_ids.clear()
         await self._client.close()
 
     async def _subscribe(self, command: SubscribeData) -> None:
@@ -107,29 +138,45 @@ class BigQMTDataClient(LiveMarketDataClient):
 
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         instrument_id = command.instrument_id
-        key = ("quote", instrument_id)
-        task = self.create_task(
-            self._poll_quote_tick(instrument_id),
-            log_msg=f"bigqmt_quote_poll: {instrument_id}",
-        )
-        if task is not None:
-            self._subscription_tasks[key] = task
+        if self._quote_push_supported:
+            self._push_quote_ids.add(instrument_id)
+            await self._add_push_code(instrument_id)
+        if self._should_poll():
+            key = ("quote", instrument_id)
+            task = self.create_task(
+                self._poll_quote_tick(instrument_id),
+                log_msg=f"bigqmt_quote_poll: {instrument_id}",
+            )
+            if task is not None:
+                self._subscription_tasks[key] = task
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
-        self._cancel_task(("quote", command.instrument_id))
+        instrument_id = command.instrument_id
+        self._cancel_task(("quote", instrument_id))
+        if self._quote_push_supported:
+            self._push_quote_ids.discard(instrument_id)
+            await self._maybe_drop_push_code(instrument_id)
 
     async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
         instrument_id = command.instrument_id
-        key = ("depth", instrument_id)
-        task = self.create_task(
-            self._poll_order_book_depth(instrument_id),
-            log_msg=f"bigqmt_depth_poll: {instrument_id}",
-        )
-        if task is not None:
-            self._subscription_tasks[key] = task
+        if self._quote_push_supported:
+            self._push_depth_ids.add(instrument_id)
+            await self._add_push_code(instrument_id)
+        if self._should_poll():
+            key = ("depth", instrument_id)
+            task = self.create_task(
+                self._poll_order_book_depth(instrument_id),
+                log_msg=f"bigqmt_depth_poll: {instrument_id}",
+            )
+            if task is not None:
+                self._subscription_tasks[key] = task
 
     async def _unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
-        self._cancel_task(("depth", command.instrument_id))
+        instrument_id = command.instrument_id
+        self._cancel_task(("depth", instrument_id))
+        if self._quote_push_supported:
+            self._push_depth_ids.discard(instrument_id)
+            await self._maybe_drop_push_code(instrument_id)
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         bar_type = command.bar_type
@@ -269,6 +316,99 @@ class BigQMTDataClient(LiveMarketDataClient):
                         f"(streak={failure_streak}): {exc}",
                     )
             await asyncio.sleep(self._config.poll_interval_secs)
+
+    def _should_poll(self) -> bool:
+        """
+        Return True if a poll task should back a new subscription.
+
+        When push is unsupported, polling is the only feed so it always runs.
+        When push is active, polling only runs as a fallback if ``poll_enabled``.
+        """
+        if not self._quote_push_supported:
+            return True
+        return self._config.poll_enabled
+
+    async def _add_push_code(self, instrument_id: InstrumentId) -> None:
+        symbol = instrument_id_to_bigqmt_symbol(instrument_id)
+        if symbol in self._push_codes:
+            return
+        self._push_codes.add(symbol)
+        await self._sync_quote_subscription()
+
+    async def _maybe_drop_push_code(self, instrument_id: InstrumentId) -> None:
+        # Keep the code while any quote OR depth subscriber still wants it.
+        if instrument_id in self._push_quote_ids or instrument_id in self._push_depth_ids:
+            return
+        symbol = instrument_id_to_bigqmt_symbol(instrument_id)
+        if symbol not in self._push_codes:
+            return
+        self._push_codes.discard(symbol)
+        await self._sync_quote_subscription()
+
+    async def _sync_quote_subscription(self) -> None:
+        """
+        (Re)subscribe the whole-quote push feed to cover the current union.
+
+        The service ref-counts/dedups per code-combination, so re-subscribing the
+        full union and retiring the previous sub id is idempotent server-side.
+        """
+        if not self._quote_push_supported:
+            return
+        prev_sub_id = self._push_sub_id
+        if not self._push_codes:
+            self._push_sub_id = None
+            if prev_sub_id is not None:
+                try:
+                    await self._client.unsubscribe_whole_quote(prev_sub_id)
+                except Exception as exc:
+                    self._log.warning(f"BigQMT whole-quote unsubscribe failed: {exc}")
+            return
+        codes = sorted(self._push_codes)
+        try:
+            sub_id = await self._client.subscribe_whole_quote(codes, self._on_quote_push)
+        except Exception as exc:
+            self._log.error(f"BigQMT whole-quote subscribe failed for {codes}: {exc}")
+            return
+        self._push_sub_id = sub_id
+        if prev_sub_id is not None and prev_sub_id != sub_id:
+            try:
+                await self._client.unsubscribe_whole_quote(prev_sub_id)
+            except Exception as exc:
+                self._log.warning(f"BigQMT whole-quote unsubscribe failed: {exc}")
+
+    def _on_quote_push(self, data) -> None:
+        # Invoked on the service's push subscriber thread (and once, inline, on
+        # the RPC executor thread for the prime snapshot). Marshal onto the loop.
+        if not isinstance(data, dict):
+            return
+        self._loop.call_soon_threadsafe(self._handle_quote_push, dict(data))
+
+    def _handle_quote_push(self, data: dict) -> None:
+        ts_init = self._clock.timestamp_ns()
+        for code, tick_data in data.items():
+            if not tick_data:
+                continue
+            try:
+                instrument_id = bigqmt_symbol_to_instrument_id(str(code))
+            except Exception as exc:
+                self._log.warning(f"BigQMT quote push: cannot map code {code!r}: {exc}")
+                continue
+            if instrument_id in self._push_quote_ids:
+                tick = parse_full_tick_as_quote_tick(
+                    instrument_id=instrument_id,
+                    payload=tick_data,
+                    ts_init=ts_init,
+                )
+                if tick is not None:
+                    self._handle_data(tick)
+            if instrument_id in self._push_depth_ids:
+                depth = parse_full_tick_as_order_book_depth10(
+                    instrument_id=instrument_id,
+                    payload=tick_data,
+                    ts_init=ts_init,
+                )
+                if depth is not None:
+                    self._handle_data(depth)
 
     def _dataframe_to_bars(self, bar_type: BarType, symbol: str, data: dict) -> list:
         df = _lookup_symbol(data, symbol)
