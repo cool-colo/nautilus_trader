@@ -2745,6 +2745,13 @@ class LiveExecutionEngine(ExecutionEngine):
                 is_external=False,
             )
 
+        if not close_result:
+            self._log.error(
+                f"Cannot reconcile cross-zero position for {report.instrument_id}: "
+                "close leg failed; skipping open leg to avoid a partial position adjustment",
+            )
+            return False
+
         # Second fill: Open new position in opposite direction
         open_qty_decimal = abs(report.signed_decimal_qty)
         open_quantity = Quantity(open_qty_decimal, instrument.size_precision)

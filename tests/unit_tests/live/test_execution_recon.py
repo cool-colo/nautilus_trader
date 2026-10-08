@@ -2782,6 +2782,51 @@ class TestReconciliationEdgeCases:
         # collides with the first and the engine cannot tell the fills apart.
         assert close_report.venue_order_id != open_report.venue_order_id
 
+    def test_cross_zero_reconciliation_does_not_open_when_close_fails(
+        self,
+        live_exec_engine,
+    ):
+        instrument = AUDUSD_SIM
+        self.cache.add_instrument(instrument)
+        live_exec_engine.generate_missing_orders = True
+
+        order = TestExecStubs.limit_order(instrument=instrument, order_side=OrderSide.SELL)
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=instrument,
+            position_id=PositionId("P-CROSS-ZERO-CLOSE-FAIL"),
+            last_qty=Quantity.from_int(100),
+            last_px=Price.from_str("1.0"),
+        )
+        internal_position = Position(instrument=instrument, fill=fill)
+        self.cache.add_position(internal_position, OmsType.NETTING)
+
+        external_report = PositionStatusReport(
+            account_id=TestIdStubs.account_id(),
+            instrument_id=instrument.id,
+            position_side=PositionSide.LONG,
+            quantity=Quantity.from_int(50),
+            avg_px_open=Decimal("1.05"),
+            report_id=UUID4(),
+            ts_last=0,
+            ts_init=0,
+        )
+        reconcile_calls = []
+
+        def fail_reconcile(order_report, trades, is_external=True):
+            reconcile_calls.append((order_report, trades, is_external))
+            return False
+
+        live_exec_engine._reconcile_order_report = fail_reconcile
+
+        result = live_exec_engine._reconcile_position_report(external_report)
+
+        assert result is False
+        assert len(reconcile_calls) == 1
+        close_report, _, _ = reconcile_calls[0]
+        assert close_report.order_side == OrderSide.BUY
+        assert close_report.quantity == Quantity.from_int(100)
+
     @pytest.mark.asyncio
     async def test_cross_zero_reconciliation_venue_order_ids_stable_on_equal_fills(
         self,

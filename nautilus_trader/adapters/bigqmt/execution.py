@@ -104,6 +104,42 @@ def _venue_order_id_value(raw: dict[str, Any]) -> str:
     return ""
 
 
+def _event_in_time_range(ts_event: int, start: Any, end: Any) -> bool:
+    """Return whether a timestamp is inside a requested report window."""
+    if ts_event <= 0:
+        return True
+    if start is not None and ts_event < int(start.timestamp() * 1_000_000_000):
+        return False
+    return end is None or ts_event <= int(end.timestamp() * 1_000_000_000)
+
+
+def _order_timestamp_ns(raw_order: dict[str, Any]) -> int:
+    return (
+        bigqmt_traded_at_to_nanos(raw_order.get("order_at"))
+        or bigqmt_traded_at_to_nanos(raw_order.get("order_time"))
+        or millis_to_nanos(raw_order.get("order_time_ms"))
+    )
+
+
+def _fill_timestamp_ns(raw_trade: dict[str, Any]) -> int:
+    return (
+        bigqmt_traded_at_to_nanos(raw_trade.get("traded_at"))
+        or bigqmt_traded_at_to_nanos(raw_trade.get("traded_time"))
+        or millis_to_nanos(raw_trade.get("traded_time_ms"))
+    )
+
+
+def _serialization_safe_info(value: Any) -> Any:
+    """Return a copy containing only values safe for Nautilus cache serialization."""
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _serialization_safe_info(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_serialization_safe_info(item) for item in value]
+    return str(value)
+
+
 class _BigQMTTraderCallback:
     """
     Adapter between the Big QMT ``XtQuantTraderCallback`` protocol and the
@@ -413,6 +449,16 @@ class BigQMTExecutionClient(LiveExecutionClient):
             status = bigqmt_status_to_order_status(raw_order.get("order_status"))
             if command.open_only and status not in _BIG_QMT_OPEN_ORDER_STATUSES:
                 continue
+            ts_event = _order_timestamp_ns(raw_order)
+            if not _event_in_time_range(ts_event, command.start, command.end):
+                self._log.warning(
+                    "Skipping BigQMT order outside requested report window: "
+                    f"venue_order_id={_venue_order_id_value(raw_order)!r}, "
+                    f"order_at={raw_order.get('order_at')!r}, "
+                    f"order_time={raw_order.get('order_time')!r}, "
+                    f"start={command.start!r}, end={command.end!r}",
+                )
+                continue
             report = self._parse_order_status_report(raw_order)
             if report is not None and (
                 command.instrument_id is None or report.instrument_id == command.instrument_id
@@ -423,6 +469,15 @@ class BigQMTExecutionClient(LiveExecutionClient):
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
         reports = []
         for raw_trade in await self._client.get_trades():
+            ts_event = _fill_timestamp_ns(raw_trade)
+            if not _event_in_time_range(ts_event, command.start, command.end):
+                self._log.warning(
+                    "Skipping BigQMT fill outside requested report window: "
+                    f"trade_id={raw_trade.get('trade_id') or raw_trade.get('traded_id')!r}, "
+                    f"traded_at={raw_trade.get('traded_at')!r}, "
+                    f"start={command.start!r}, end={command.end!r}",
+                )
+                continue
             report = self._parse_fill_report(raw_trade)
             if report is None:
                 continue
@@ -726,7 +781,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
             commission=report.commission,
             liquidity_side=report.liquidity_side,
             ts_event=report.ts_event,
-            info=raw_trade,
+            info=_serialization_safe_info(raw_trade),
         )
 
     def _parse_order_status_report(self, raw_order: dict[str, Any]) -> OrderStatusReport | None:
@@ -740,7 +795,8 @@ class BigQMTExecutionClient(LiveExecutionClient):
         if order_volume <= 0:
             return None
         status = bigqmt_status_to_order_status(raw_order.get("order_status"))
-        ts = self._clock.timestamp_ns()
+        ts_init = self._clock.timestamp_ns()
+        ts_event = _order_timestamp_ns(raw_order) or ts_init
         return OrderStatusReport(
             account_id=self.account_id,
             instrument_id=bigqmt_symbol_to_instrument_id(str(raw_order.get("stock_code", ""))),
@@ -755,9 +811,9 @@ class BigQMTExecutionClient(LiveExecutionClient):
             price=Price.from_str(f"{price:.2f}") if price > 0 else None,
             avg_px=Decimal(str(raw_order.get("traded_price", "0") or "0")),
             report_id=UUID4(),
-            ts_accepted=ts,
-            ts_last=ts,
-            ts_init=ts,
+            ts_accepted=ts_event,
+            ts_last=ts_event,
+            ts_init=ts_init,
             cancel_reason=raw_order.get("status_msg")
             if status == OrderStatus.CANCELED
             else None,
@@ -805,11 +861,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
             commission=Money(commission, CNY),
             liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
             report_id=UUID4(),
-            ts_event=(
-                bigqmt_traded_at_to_nanos(raw_trade.get("traded_at"))
-                or millis_to_nanos(raw_trade.get("traded_time_ms"))
-                or self._clock.timestamp_ns()
-            ),
+            ts_event=_fill_timestamp_ns(raw_trade) or self._clock.timestamp_ns(),
             ts_init=self._clock.timestamp_ns(),
         )
 

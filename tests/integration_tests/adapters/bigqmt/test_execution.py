@@ -22,6 +22,8 @@ from types import SimpleNamespace
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_VENUE
 from nautilus_trader.adapters.bigqmt.execution import BigQMTExecutionClient
 from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import GenerateFillReports
+from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
@@ -49,13 +51,21 @@ class _FakeClock:
 
 
 class _FakeClient:
-    def __init__(self, positions=(), submit_response=None):
+    def __init__(self, positions=(), submit_response=None, orders=(), trades=()):
         self._positions = list(positions)
         self._submit_response = submit_response or {}
+        self._orders = list(orders)
+        self._trades = list(trades)
         self.submit_calls = []
 
     async def get_positions(self):
         return self._positions
+
+    async def get_orders(self, cancelable_only=False):
+        return self._orders
+
+    async def get_trades(self):
+        return self._trades
 
     async def submit_order(self, **kwargs):
         self.submit_calls.append(kwargs)
@@ -103,10 +113,12 @@ class _StubExecClient:
     _order_side = BigQMTExecutionClient._order_side
     _order_price = BigQMTExecutionClient._order_price
     _submit_nautilus_order = BigQMTExecutionClient._submit_nautilus_order
+    generate_order_status_reports = BigQMTExecutionClient.generate_order_status_reports
+    generate_fill_reports = BigQMTExecutionClient.generate_fill_reports
     generate_position_status_reports = BigQMTExecutionClient.generate_position_status_reports
 
-    def __init__(self, positions=(), submit_response=None):
-        self._client = _FakeClient(positions, submit_response)
+    def __init__(self, positions=(), submit_response=None, orders=(), trades=()):
+        self._client = _FakeClient(positions, submit_response, orders, trades)
         self._log = _FakeLog()
         self._config = SimpleNamespace(
             default_limit_price_type=11,
@@ -184,6 +196,67 @@ def test_parse_order_status_report_maps_bigqmt_fields():
     assert report.avg_px == Decimal(0)
 
 
+def test_parse_order_status_report_uses_broker_order_time():
+    order_time = int(datetime(2026, 9, 30, 1, 30, 9, tzinfo=UTC).timestamp())
+    report = _StubExecClient()._parse_order_status_report(
+        {
+            "stock_code": "000001.SZ",
+            "order_sysid": "7788",
+            "order_remark": "O-1",
+            "action": "BUY",
+            "price_type": 11,
+            "order_volume": 100,
+            "order_status": 50,
+            "order_time": order_time,
+        },
+    )
+
+    assert report is not None
+    expected = order_time * 1_000_000_000
+    assert report.ts_accepted == expected
+    assert report.ts_last == expected
+    assert report.ts_init == 123
+
+
+def test_generate_order_status_reports_filters_stale_orders():
+    base_order = {
+        "stock_code": "000001.SZ",
+        "order_remark": "O-1",
+        "action": "BUY",
+        "price_type": 11,
+        "order_volume": 100,
+        "order_status": 50,
+    }
+    client = _StubExecClient(
+        orders=[
+            {
+                **base_order,
+                "order_sysid": "1",
+                "order_time": int(datetime(2026, 9, 30, 1, 30, 9, tzinfo=UTC).timestamp()),
+            },
+            {
+                **base_order,
+                "order_sysid": "2",
+                "order_time": int(datetime(2026, 10, 8, 1, 30, 9, tzinfo=UTC).timestamp()),
+            },
+        ],
+    )
+    command = GenerateOrderStatusReports(
+        instrument_id=None,
+        start=datetime(2026, 10, 7, tzinfo=UTC),
+        end=datetime(2026, 10, 9, tzinfo=UTC),
+        open_only=False,
+        command_id=UUID4(),
+        ts_init=client._clock.timestamp_ns(),
+    )
+
+    reports = asyncio.run(client.generate_order_status_reports(command))
+
+    assert [str(report.venue_order_id) for report in reports] == ["2"]
+    assert len(client._log.warnings) == 1
+    assert "venue_order_id='1'" in client._log.warnings[0]
+
+
 def test_parse_order_status_report_drops_zero_volume():
     report = _StubExecClient()._parse_order_status_report(
         {"stock_code": "000001.SZ", "order_sysid": "1", "order_volume": 0},
@@ -217,6 +290,48 @@ def test_parse_fill_report_maps_bigqmt_fields():
 
 def test_parse_fill_report_drops_missing_ids():
     assert _StubExecClient()._parse_fill_report({"traded_price": 10.0, "traded_volume": 100}) is None
+
+
+def test_generate_fill_reports_filters_stale_fill_before_parsing():
+    client = _StubExecClient(
+        trades=[
+            {
+                "stock_code": "300866.SZ",
+                "order_sysid": "236",
+                "trade_id": "OLD",
+                "traded_volume": 100,
+                "traded_price": 125.0,
+                "traded_time": int(
+                    datetime(2026, 9, 30, 1, 30, 40, tzinfo=UTC).timestamp(),
+                ),
+            },
+            {
+                "stock_code": "000001.SZ",
+                "order_sysid": "7788",
+                "order_remark": "O-1",
+                "trade_id": "CURRENT",
+                "action": "BUY",
+                "traded_volume": 100,
+                "traded_price": 11.5,
+                "traded_at": "2026-10-08 09:30:40",
+            },
+        ],
+    )
+    command = GenerateFillReports(
+        instrument_id=None,
+        venue_order_id=None,
+        start=datetime(2026, 10, 7, tzinfo=UTC),
+        end=datetime(2026, 10, 9, tzinfo=UTC),
+        command_id=UUID4(),
+        ts_init=client._clock.timestamp_ns(),
+    )
+
+    reports = asyncio.run(client.generate_fill_reports(command))
+
+    assert [str(report.trade_id) for report in reports] == ["CURRENT"]
+    assert client._log.errors == []
+    assert len(client._log.warnings) == 1
+    assert "trade_id='OLD'" in client._log.warnings[0]
 
 
 def test_order_side_prefers_action_then_order_type():
@@ -353,6 +468,33 @@ def test_trade_callback_without_remark_can_be_recovered_by_later_poll():
 
     assert client._seen_trade_ids == {TradeId("T-42")}
     assert len(client.filled) == 1
+
+
+def test_trade_callback_sanitizes_non_serializable_info_values():
+    class BrokerOrderId(int):
+        def __str__(self):
+            return "7788"
+
+    client = _StubExecClient()
+    order = _test_order()
+    client._orders[order.client_order_id] = order
+    broker_order_id = BrokerOrderId(7788)
+    raw_trade = {
+        "stock_code": "000001.SZ",
+        "order_sysid": "7788",
+        "order_id": broker_order_id,
+        "order_remark": "O-1",
+        "trade_id": "T-42",
+        "action": "BUY",
+        "traded_volume": 100,
+        "traded_price": 11.5,
+    }
+
+    client._handle_trade_update(raw_trade)
+
+    assert len(client.filled) == 1
+    assert client.filled[0]["info"]["order_id"] == "7788"
+    assert raw_trade["order_id"] is broker_order_id
 
 
 def test_trade_callback_rejects_source_instrument_without_exchange_suffix():
