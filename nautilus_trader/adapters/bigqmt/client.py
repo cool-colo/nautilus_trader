@@ -142,6 +142,9 @@ class BigQMTClient:
     async def get_instrument_detail(self, stock_code: str) -> dict[str, Any]:
         return await self._run(self._xtdata.get_instrument_detail, stock_code) or {}
 
+    async def get_all_instrument_details(self) -> dict[str, dict[str, Any]]:
+        return await self._run(self._xtdata.get_all_instrument_details) or {}
+
     async def get_stock_list_in_sector(self, sector_name: str) -> list[str]:
         result = await self._run(self._xtdata.get_stock_list_in_sector, sector_name)
         return list(result or [])

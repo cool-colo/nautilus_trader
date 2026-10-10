@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from nautilus_trader.adapters.bigqmt.client import BigQMTClient
@@ -29,7 +30,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 
 
 # "沪深A股" is the Big QMT whole-market A-share sector (Shanghai + Shenzhen),
-# enumerating every tradable A-share via get_stock_list_in_sector.
+# used by the legacy per-instrument fallback loader.
 DEFAULT_LOAD_ALL_SECTORS: frozenset[str] = frozenset({"沪深A股"})
 
 # Max concurrent instrument-detail RPCs during startup loading. Kept in step
@@ -43,9 +44,9 @@ class BigQMTInstrumentProviderConfig(InstrumentProviderConfig, frozen=True):
 
     For deterministic startup loading, use ``load_ids`` or ``load_symbols``. When
     ``load_all=True`` and neither ``load_symbols`` nor ``filters["symbols"]`` is
-    given, the provider enumerates the exchange-wide stock master by aggregating
-    the symbols of ``load_all_sectors`` via ``get_stock_list_in_sector`` (default
-    the whole-market A-share sector).
+    given, the provider loads the exchange-wide stock master in one RPC via
+    ``get_all_instrument_details``. The legacy sector-based per-instrument loader
+    remains available internally for easy recovery, but is not used automatically.
     """
 
     load_symbols: frozenset[str] | None = None
@@ -100,16 +101,18 @@ class BigQMTInstrumentProvider(InstrumentProvider):
 
     async def load_all_async(self, filters: dict | None = None) -> None:
         symbols = self._resolve_load_all_symbols(filters)
-        if not symbols:
-            symbols = await self._resolve_sector_symbols()
-        if not symbols:
+        if symbols:
+            await self._load_symbols(symbols)
+            return
+
+        details = await self._client.get_all_instrument_details()
+        if not isinstance(details, dict) or not details:
             self._log.warning(
-                "BigQMT cannot load all instruments: no explicit symbols configured and "
-                "get_stock_list_in_sector returned no symbols for the configured sectors. "
-                "Set load_ids, load_symbols, filters={'symbols': [...]}, or load_all_sectors.",
+                "BigQMT get_all_instrument_details returned an invalid or empty response.",
             )
             return
-        await self._load_symbols(symbols)
+
+        self._load_instrument_details(details)
 
     async def load_ids_async(
         self,
@@ -131,6 +134,46 @@ class BigQMTInstrumentProvider(InstrumentProvider):
         filters = filters or self._config_bigqmt.filters or {}
         raw_symbols: Any = filters.get("symbols") or self._config_bigqmt.load_symbols or []
         return [normalize_qmt_symbol(str(symbol)) for symbol in raw_symbols if str(symbol).strip()]
+
+    async def _load_all_individually(self) -> None:
+        """
+        Load all configured sectors using the legacy per-instrument RPC solution.
+
+        This is retained for easy recovery but is not called automatically.
+        """
+        symbols = await self._resolve_sector_symbols()
+        if not symbols:
+            self._log.warning(
+                "BigQMT cannot load all instruments: no explicit symbols configured and "
+                "get_stock_list_in_sector returned no symbols for the configured sectors. "
+                "Set load_ids, load_symbols, filters={'symbols': [...]}, or load_all_sectors.",
+            )
+            return
+        await self._load_symbols(symbols)
+
+    def _load_instrument_details(self, details: dict[str, dict[str, Any]]) -> list[str]:
+        """Parse and add details returned by the whole-market bulk RPC."""
+        failed_symbols: list[str] = []
+        now = self._clock.timestamp_ns()
+        for symbol, detail in details.items():
+            try:
+                fields = detail.get("fields", detail)
+                instrument = parse_equity(
+                    symbol=detail.get("symbol", symbol),
+                    fields=fields,
+                    ts_event=now,
+                    ts_init=now,
+                )
+                self.add(instrument)
+            except Exception as exc:
+                failed_symbols.append(symbol)
+                self._log.warning(f"BigQMT failed to parse bulk instrument {symbol}: {exc}")
+
+        self._log.info(
+            f"Loaded {len(details) - len(failed_symbols)}/{len(details)} BigQMT instruments "
+            "from get_all_instrument_details",
+        )
+        return failed_symbols
 
     async def _resolve_sector_symbols(self) -> list[str]:
         """
@@ -162,9 +205,12 @@ class BigQMTInstrumentProvider(InstrumentProvider):
         # (thousands of names) serially would exceed timeouts, so bound concurrency
         # and gather in parallel.
         semaphore = asyncio.Semaphore(_LOAD_CONCURRENCY)
+        total = len(symbols)
 
-        async def _load_one(symbol: str) -> None:
+        async def _load_one(index: int, symbol: str) -> None:
             async with semaphore:
+                started_at = time.perf_counter()
+                self._log.info(f"Loading BigQMT instrument [{index}/{total}]: {symbol}")
                 detail = await self._client.get_instrument_detail(symbol)
             fields = detail.get("fields", detail)
             now = self._clock.timestamp_ns()
@@ -175,9 +221,13 @@ class BigQMTInstrumentProvider(InstrumentProvider):
                 ts_init=now,
             )
             self.add(instrument)
+            elapsed = time.perf_counter() - started_at
+            self._log.info(
+                f"Loaded BigQMT instrument [{index}/{total}]: {symbol} in {elapsed:.3f}s",
+            )
 
         results = await asyncio.gather(
-            *(_load_one(symbol) for symbol in symbols),
+            *(_load_one(index, symbol) for index, symbol in enumerate(symbols, start=1)),
             return_exceptions=True,
         )
         failures = [
