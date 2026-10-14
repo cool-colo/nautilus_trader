@@ -246,7 +246,8 @@ class BigQMTClient:
         ) or {}
 
     async def cancel_order(self, order_id: str) -> bool:
-        return bool(await self._run(self._trader.cancel_order_stock, self._account, order_id))
+        result = await self._run(self._trader.cancel_order_stock, self._account, order_id)
+        return result == 0
 
     # ---------------------------------------------------------------------
     # Real-time execution events (Redis Pub/Sub)
