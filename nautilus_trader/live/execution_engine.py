@@ -750,6 +750,13 @@ class LiveExecutionEngine(ExecutionEngine):
 
             retries = self._recon_check_retries[order.client_order_id]
             if retries >= self.inflight_check_max_retries:
+                if self._has_unresolved_submission(order):
+                    self._log.warning(
+                        f"Deferring inflight resolution for {order.client_order_id!r} - "
+                        "execution client reports an unresolved submission outcome",
+                        LogColor.YELLOW,
+                    )
+                    continue
                 backlog = self.evt_qsize()
                 if backlog > 0:
                     self._log.debug(
@@ -788,6 +795,14 @@ class LiveExecutionEngine(ExecutionEngine):
             self._order_local_activity_ns.pop(order.client_order_id, None)
             return
 
+        if self._has_unresolved_submission(order):
+            self._log.warning(
+                f"Skipping forced rejection for {order.client_order_id!r} - "
+                "execution client reports an unresolved submission outcome",
+                LogColor.YELLOW,
+            )
+            return
+
         ts_now = self._clock.timestamp_ns()
 
         if order.status == OrderStatus.SUBMITTED:
@@ -810,6 +825,16 @@ class LiveExecutionEngine(ExecutionEngine):
 
         self._clear_recon_tracking(order.client_order_id)
         self._order_local_activity_ns.pop(order.client_order_id, None)
+
+    def _has_unresolved_submission(self, order: Order) -> bool:
+        client_id = self._cache.client_id(order.client_order_id)
+        client = self._clients.get(client_id) if client_id is not None else None
+        if client is None:
+            client = self._routing_map.get(order.instrument_id.venue, self._default_client)
+        return bool(
+            client is not None
+            and client.has_unresolved_submission(order.client_order_id)
+        )
 
     async def _check_positions_consistency(self) -> None:
         if self._is_shutting_down:
@@ -1516,6 +1541,15 @@ class LiveExecutionEngine(ExecutionEngine):
             return
 
         if order.status == OrderStatus.SUBMITTED:
+            if self._has_unresolved_submission(order):
+                self._log.warning(
+                    f"Reconciling {order.client_order_id!r}: order absent from the venue "
+                    "snapshot but submission outcome is unresolved; keeping SUBMITTED",
+                    LogColor.YELLOW,
+                )
+                self._clear_recon_tracking(order.client_order_id, drop_last_query=False)
+                self._ts_last_query[order.client_order_id] = ts_now
+                return
             self._log.warning(
                 f"Reconciling {order.client_order_id!r}: SUBMITTED order not found at venue, marking as REJECTED",
                 LogColor.YELLOW,

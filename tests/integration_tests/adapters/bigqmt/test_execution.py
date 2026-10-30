@@ -51,11 +51,12 @@ class _FakeClock:
 
 
 class _FakeClient:
-    def __init__(self, positions=(), submit_response=None, orders=(), trades=()):
+    def __init__(self, positions=(), submit_response=None, orders=(), trades=(), submit_error=None):
         self._positions = list(positions)
         self._submit_response = submit_response or {}
         self._orders = list(orders)
         self._trades = list(trades)
+        self._submit_error = submit_error
         self.submit_calls = []
 
     async def get_positions(self):
@@ -69,6 +70,8 @@ class _FakeClient:
 
     async def submit_order(self, **kwargs):
         self.submit_calls.append(kwargs)
+        if self._submit_error is not None:
+            raise self._submit_error
         return self._submit_response
 
 
@@ -113,12 +116,13 @@ class _StubExecClient:
     _order_side = BigQMTExecutionClient._order_side
     _order_price = BigQMTExecutionClient._order_price
     _submit_nautilus_order = BigQMTExecutionClient._submit_nautilus_order
+    has_unresolved_submission = BigQMTExecutionClient.has_unresolved_submission
     generate_order_status_reports = BigQMTExecutionClient.generate_order_status_reports
     generate_fill_reports = BigQMTExecutionClient.generate_fill_reports
     generate_position_status_reports = BigQMTExecutionClient.generate_position_status_reports
 
-    def __init__(self, positions=(), submit_response=None, orders=(), trades=()):
-        self._client = _FakeClient(positions, submit_response, orders, trades)
+    def __init__(self, positions=(), submit_response=None, orders=(), trades=(), submit_error=None):
+        self._client = _FakeClient(positions, submit_response, orders, trades, submit_error)
         self._log = _FakeLog()
         self._config = SimpleNamespace(
             default_limit_price_type=11,
@@ -131,12 +135,15 @@ class _StubExecClient:
         self._known_client_order_ids = {}
         self._seen_trade_ids = set()
         self._terminal_events = set()
+        self._terminal_client_order_ids = set()
+        self._pending_submissions = {}
         self._orders = {}
         self._cache = _FakeCache(self._orders)
         self.account_states = []
         self.submitted = []
         self.accepted = []
         self.rejected = []
+        self.denied = []
         self.cancel_rejected = []
         self.filled = []
 
@@ -151,6 +158,9 @@ class _StubExecClient:
 
     def generate_order_rejected(self, **kwargs):
         self.rejected.append(kwargs)
+
+    def generate_order_denied(self, **kwargs):
+        self.denied.append(kwargs)
 
     def generate_order_cancel_rejected(self, **kwargs):
         self.cancel_rejected.append(kwargs)
@@ -363,6 +373,8 @@ def test_submit_keeps_order_submitted_when_passorder_is_asynchronous():
     client = _StubExecClient(
         submit_response={
             "status": "SUBMITTED",
+            "submission_state": "LIVE_UNASSIGNED",
+            "dispatched": True,
             "user_order_id": "O-1",
             "order_sys_id": None,
             "message": "passorder submitted",
@@ -375,14 +387,66 @@ def test_submit_keeps_order_submitted_when_passorder_is_asynchronous():
     assert len(client.submitted) == 1
     assert client.accepted == []
     assert client.rejected == []
+    assert client.has_unresolved_submission(order.client_order_id)
     assert client._client.submit_calls[0]["order_remark"] == "O-1"
     assert client._known_client_order_ids == {}
+
+
+def test_submit_exception_keeps_order_submitted_as_outcome_unknown():
+    client = _StubExecClient(submit_error=TimeoutError("response lost"))
+    order = _test_order()
+
+    asyncio.run(client._submit_nautilus_order(order))
+
+    assert len(client.submitted) == 1
+    assert client.rejected == []
+    assert client.denied == []
+    assert client.has_unresolved_submission(order.client_order_id)
+
+
+def test_submit_maps_not_dispatched_to_denied():
+    client = _StubExecClient(
+        submit_response={
+            "status": "NOT_DISPATCHED",
+            "submission_state": "NOT_DISPATCHED",
+            "dispatched": False,
+            "user_order_id": "O-1",
+            "message": "expired before dispatch",
+        },
+    )
+    order = _test_order()
+
+    asyncio.run(client._submit_nautilus_order(order))
+
+    assert len(client.denied) == 1
+    assert client.rejected == []
+    assert not client.has_unresolved_submission(order.client_order_id)
+
+
+def test_submit_maps_explicit_rejection_to_rejected():
+    client = _StubExecClient(
+        submit_response={
+            "status": "REJECTED",
+            "submission_state": "REJECTED",
+            "dispatched": True,
+            "user_order_id": "O-1",
+            "message": "counter refused",
+        },
+    )
+    order = _test_order()
+
+    asyncio.run(client._submit_nautilus_order(order))
+
+    assert len(client.rejected) == 1
+    assert "counter refused" in client.rejected[0]["reason"]
+    assert not client.has_unresolved_submission(order.client_order_id)
 
 
 def test_order_callback_without_remark_does_not_block_later_poll_correlation():
     client = _StubExecClient()
     order = _test_order()
     client._orders[order.client_order_id] = order
+    client._pending_submissions[order.client_order_id] = "LIVE_UNASSIGNED"
     venue_order_id = VenueOrderId("7788")
 
     client._handle_order_update({"order_sysid": "7788", "order_status": 50})
@@ -397,6 +461,7 @@ def test_order_callback_without_remark_does_not_block_later_poll_correlation():
     assert client._known_order_status[venue_order_id] == OrderStatus.ACCEPTED
     assert client._known_client_order_ids[venue_order_id] == order.client_order_id
     assert len(client.accepted) == 1
+    assert not client.has_unresolved_submission(order.client_order_id)
 
 
 def test_order_callback_ignores_client_order_id_used_as_temporary_order_id():
@@ -468,6 +533,28 @@ def test_trade_callback_without_remark_can_be_recovered_by_later_poll():
 
     assert client._seen_trade_ids == {TradeId("T-42")}
     assert len(client.filled) == 1
+    assert len(client.accepted) == 1
+
+
+def test_late_callback_resolves_original_submission_after_long_delay():
+    client = _StubExecClient()
+    order = _test_order("O-20261030-013001-004-001-37")
+    client._orders[order.client_order_id] = order
+    client._pending_submissions[order.client_order_id] = "LIVE_UNASSIGNED"
+
+    # The adapter deliberately has no elapsed-time cutoff: a callback 187s
+    # later still belongs to the original client order ID.
+    client._handle_order_update(
+        {
+            "order_sysid": "1082133611",
+            "order_status": 50,
+            "order_remark": order.client_order_id.value,
+        },
+    )
+
+    assert len(client.accepted) == 1
+    assert client.accepted[0]["venue_order_id"] == VenueOrderId("1082133611")
+    assert not client.has_unresolved_submission(order.client_order_id)
 
 
 def test_trade_callback_sanitizes_non_serializable_info_values():

@@ -56,6 +56,7 @@ from nautilus_trader.adapters.qmt.common import qmt_order_type_from_price_type
 from nautilus_trader.adapters.qmt.common import qmt_side_to_nautilus
 from nautilus_trader.adapters.qmt.common import quantity_to_int
 from nautilus_trader.adapters.qmt.common import timestamp_to_qmt_str
+from nautilus_trader.adapters.qmt.equity_quantity_rules import a_share_limit_order_quantity_rules
 from nautilus_trader.model.currencies import CNY
 from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.data import OrderBookDepth10
@@ -205,6 +206,7 @@ def parse_equity(
         ts_init=ts_init,
         info={
             "qmt_symbol": bigqmt_symbol,
+            "limit_order_quantity_rules": a_share_limit_order_quantity_rules(bigqmt_symbol),
             "name": str(name),
             "instrument_status": qmt_instrument_status(fields),
             "is_suspended": qmt_is_suspended(fields),

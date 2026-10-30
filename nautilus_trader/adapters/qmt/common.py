@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from nautilus_trader.adapters.qmt.constants import QMT_VENUE
+from nautilus_trader.adapters.qmt.equity_quantity_rules import a_share_limit_order_quantity_rules
 from nautilus_trader.model.currencies import CNY
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
@@ -153,6 +154,7 @@ def parse_equity(
         ts_init=ts_init,
         info={
             "qmt_symbol": qmt_symbol,
+            "limit_order_quantity_rules": a_share_limit_order_quantity_rules(qmt_symbol),
             "name": str(name),
             # Parsed convenience flags so strategies need not re-parse raw QMT
             # string fields. See qmt_is_suspended for the authoritative rule.

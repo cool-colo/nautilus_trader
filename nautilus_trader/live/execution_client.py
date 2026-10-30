@@ -59,6 +59,7 @@ from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import order_side_to_str
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Currency
 
@@ -134,6 +135,16 @@ class LiveExecutionClient(ExecutionClient):
         self._instrument_provider = instrument_provider
 
         self.reconciliation_active = False
+
+    def has_unresolved_submission(self, client_order_id: ClientOrderId) -> bool:
+        """
+        Return whether a submitted order has an ambiguous venue outcome.
+
+        Adapters override this when a write may have reached the venue before
+        its acknowledgement or venue order ID became observable. The live
+        execution engine must not synthesize a rejection for such an order.
+        """
+        return False
 
     async def run_after_delay(
         self,

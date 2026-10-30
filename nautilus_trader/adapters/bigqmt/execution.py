@@ -81,6 +81,12 @@ _BIG_QMT_OPEN_ORDER_STATUSES = {
     OrderStatus.SUBMITTED,
 }
 
+_UNRESOLVED_SUBMISSION_STATES = {
+    "DISPATCHED_UNCONFIRMED",
+    "LIVE_UNASSIGNED",
+    "OUTCOME_UNKNOWN",
+}
+
 
 def _client_order_id_value(raw: dict[str, Any]) -> str:
     return str(
@@ -219,6 +225,8 @@ class BigQMTExecutionClient(LiveExecutionClient):
         self._known_client_order_ids: dict[VenueOrderId, ClientOrderId] = {}
         self._seen_trade_ids: set[TradeId] = set()
         self._terminal_events: set[VenueOrderId] = set()
+        self._terminal_client_order_ids: set[ClientOrderId] = set()
+        self._pending_submissions: dict[ClientOrderId, str] = {}
         self._last_account_key: tuple[Decimal, Decimal, Decimal, Decimal] | None = None
 
         self._set_account_id(AccountId(f"{client_id.value}-{config.account_id}"))
@@ -249,6 +257,9 @@ class BigQMTExecutionClient(LiveExecutionClient):
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         await self._submit_nautilus_order(command.order)
+
+    def has_unresolved_submission(self, client_order_id: ClientOrderId) -> bool:
+        return client_order_id in self._pending_submissions
 
     async def _submit_nautilus_order(self, order) -> None:
         if order.order_type not in {OrderType.MARKET, OrderType.LIMIT}:
@@ -304,6 +315,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
             client_order_id=order.client_order_id,
             ts_event=self._clock.timestamp_ns(),
         )
+        self._pending_submissions[order.client_order_id] = "OUTCOME_UNKNOWN"
         try:
             response = await self._client.submit_order(
                 stock_code=instrument_id_to_bigqmt_symbol(order.instrument_id),
@@ -315,41 +327,54 @@ class BigQMTExecutionClient(LiveExecutionClient):
                 order_remark=order.client_order_id.value,
             )
         except Exception as exc:
+            # A write-side exception cannot prove that passorder did not run.
+            # Keep the order SUBMITTED until a callback or reconciliation row
+            # provides an explicit venue outcome.
+            self._log.warning(
+                f"BigQMT submission outcome unknown for {order.client_order_id}; "
+                f"keeping order SUBMITTED: {exc}",
+            )
+            return
+
+        submission_state = str(response.get("submission_state") or "OUTCOME_UNKNOWN").upper()
+        self._pending_submissions[order.client_order_id] = submission_state
+
+        if submission_state == "NOT_DISPATCHED":
+            self._pending_submissions.pop(order.client_order_id, None)
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=str(response.get("message") or "BigQMT did not dispatch the order"),
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        if submission_state == "REJECTED":
+            self._pending_submissions.pop(order.client_order_id, None)
+            self._terminal_client_order_ids.add(order.client_order_id)
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
-                reason=str(exc),
+                reason=str(response.get("message") or "BigQMT explicitly rejected the order"),
                 ts_event=self._clock.timestamp_ns(),
             )
             return
 
         order_sys_id = str(response.get("order_sys_id") or response.get("order_sysid") or "")
         if not order_sys_id or order_sys_id == "-1":
-            # ``passorder`` is asynchronous in the QMT strategy runtime.  The bridge
-            # acknowledges a successfully handed-off request as SUBMITTED, but the
-            # broker order system ID is only available from a later callback/poll.
-            # Keep Nautilus in Submitted until that correlation arrives; rejecting
-            # here could cause a strategy retry after QMT has already placed the order.
-            if (
-                str(response.get("status") or "").upper() == "SUBMITTED"
-                and str(response.get("user_order_id") or "") == order.client_order_id.value
-            ):
-                self._log.info(
-                    f"BigQMT order submitted asynchronously, awaiting venue order ID: "
-                    f"{order.client_order_id}",
-                )
-                return
-            self.generate_order_rejected(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                reason=str(response.get("message") or "BigQMT order submission failed"),
-                ts_event=self._clock.timestamp_ns(),
+            if submission_state not in _UNRESOLVED_SUBMISSION_STATES:
+                submission_state = "OUTCOME_UNKNOWN"
+                self._pending_submissions[order.client_order_id] = submission_state
+            self._log.warning(
+                f"BigQMT order submission remains {submission_state}; awaiting venue order ID "
+                f"for {order.client_order_id}: {response.get('message') or ''}",
             )
             return
 
         venue_order_id = VenueOrderId(order_sys_id)
+        self._pending_submissions.pop(order.client_order_id, None)
         self._known_client_order_ids[venue_order_id] = order.client_order_id
         self.generate_order_accepted(
             strategy_id=order.strategy_id,
@@ -595,6 +620,8 @@ class BigQMTExecutionClient(LiveExecutionClient):
         order = self._cache.order(client_order_id)
         if order is None:
             return
+        if client_order_id in self._terminal_client_order_ids:
+            return
 
         status = bigqmt_status_to_order_status(
             raw_order.get("order_status", raw_order.get("status")),
@@ -603,22 +630,27 @@ class BigQMTExecutionClient(LiveExecutionClient):
         if previous_status == status:
             return
         self._known_order_status[venue_order_id] = status
+        self._pending_submissions.pop(client_order_id, None)
 
         # Prefer QMT's recorded委托时间 (m_strInsertDate+Time, normalized to order_at)
         # over the local receive clock, so the persisted order_time is authoritative.
         ts_event = bigqmt_traded_at_to_nanos(raw_order.get("order_at")) or self._clock.timestamp_ns()
+        if previous_status is None and status != OrderStatus.REJECTED:
+            # A callback/poll may first observe the order after it has already
+            # filled or canceled. Establish the venue ID before any terminal
+            # update or fill is applied.
+            self.generate_order_accepted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=ts_event,
+            )
+
         if status == OrderStatus.PENDING_CANCEL:
             return
 
         if status in {OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED}:
-            if previous_status is None:
-                self.generate_order_accepted(
-                    strategy_id=order.strategy_id,
-                    instrument_id=order.instrument_id,
-                    client_order_id=client_order_id,
-                    venue_order_id=venue_order_id,
-                    ts_event=ts_event,
-                )
             return
 
         self._handle_terminal_order_update(
@@ -639,7 +671,11 @@ class BigQMTExecutionClient(LiveExecutionClient):
         status: OrderStatus,
         ts_event: int,
     ) -> None:
-        if venue_order_id in self._terminal_events:
+        self._pending_submissions.pop(client_order_id, None)
+        if (
+            venue_order_id in self._terminal_events
+            or client_order_id in self._terminal_client_order_ids
+        ):
             return
         if status == OrderStatus.CANCELED:
             self.generate_order_canceled(
@@ -650,6 +686,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
                 ts_event=ts_event,
             )
             self._terminal_events.add(venue_order_id)
+            self._terminal_client_order_ids.add(client_order_id)
         elif status == OrderStatus.REJECTED:
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
@@ -659,6 +696,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
                 ts_event=ts_event,
             )
             self._terminal_events.add(venue_order_id)
+            self._terminal_client_order_ids.add(client_order_id)
 
     def _resolve_error_ids(
         self,
@@ -697,6 +735,8 @@ class BigQMTExecutionClient(LiveExecutionClient):
                 f"Ignoring BigQMT order_error with no cached order; raw={raw!r}",
             )
             return
+        if client_order_id in self._terminal_client_order_ids:
+            return
         # Dedup against the same two sets the poll loop writes so a status-57
         # reject arriving via either path is emitted exactly once.
         if venue_order_id is not None:
@@ -705,6 +745,8 @@ class BigQMTExecutionClient(LiveExecutionClient):
             self._known_order_status[venue_order_id] = OrderStatus.REJECTED
             self._terminal_events.add(venue_order_id)
         reason = str(raw.get("error_msg") or raw.get("status_msg") or "BigQMT order rejected")
+        self._pending_submissions.pop(client_order_id, None)
+        self._terminal_client_order_ids.add(client_order_id)
         self.generate_order_rejected(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -765,6 +807,17 @@ class BigQMTExecutionClient(LiveExecutionClient):
             return
         if report.trade_id in self._seen_trade_ids:
             return
+        if report.venue_order_id not in self._known_order_status:
+            self._known_client_order_ids[report.venue_order_id] = client_order_id
+            self.generate_order_accepted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=report.venue_order_id,
+                ts_event=report.ts_event,
+            )
+            self._known_order_status[report.venue_order_id] = OrderStatus.ACCEPTED
+        self._pending_submissions.pop(client_order_id, None)
         self._seen_trade_ids.add(report.trade_id)
         self.generate_order_filled(
             strategy_id=order.strategy_id,

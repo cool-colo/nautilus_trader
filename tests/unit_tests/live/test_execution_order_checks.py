@@ -713,6 +713,36 @@ async def test_check_inflight_orders_respects_retry_limit(
 
 
 @pytest.mark.asyncio
+async def test_check_inflight_orders_keeps_unresolved_submission(
+    exec_engine_inflight_check,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    exec_engine = exec_engine_inflight_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order)
+    submitted_event = TestEventStubs.order_submitted(
+        order,
+        account_id=account_id,
+        ts_event=clock.timestamp_ns() - 200_000_000_000,
+    )
+    order.apply(submitted_event)
+    exec_engine.process(submitted_event)
+    cache.update_order(order)
+    exec_engine._recon_check_retries[order.client_order_id] = 2
+    exec_client.has_unresolved_submission = (
+        lambda client_order_id: client_order_id == order.client_order_id
+    )
+
+    await exec_engine._check_inflight_orders()
+
+    assert order.status == OrderStatus.SUBMITTED
+    assert exec_engine._recon_check_retries[order.client_order_id] == 2
+
+
+@pytest.mark.asyncio
 async def test_check_inflight_orders_increments_retry_count(
     exec_engine_inflight_check,
     cache,

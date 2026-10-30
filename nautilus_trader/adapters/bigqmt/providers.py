@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from itertools import islice
 from typing import Any
 
 from nautilus_trader.adapters.bigqmt.client import BigQMTClient
@@ -111,6 +113,21 @@ class BigQMTInstrumentProvider(InstrumentProvider):
                 "BigQMT get_all_instrument_details returned an invalid or empty response.",
             )
             return
+
+        sample_count = min(3, len(details))
+        for index, (symbol, detail) in enumerate(islice(details.items(), sample_count), start=1):
+            self._log.info(
+                f"BigQMT get_all_instrument_details sample [{index}/{sample_count}]: "
+                f"symbol={symbol} detail={json.dumps(detail, ensure_ascii=False, default=str)}",
+            )
+
+        for symbol, detail in details.items():
+            if symbol.startswith("688"):
+                self._log.info(
+                    "BigQMT get_all_instrument_details sample [688]: "
+                    f"symbol={symbol} detail={json.dumps(detail, ensure_ascii=False, default=str)}",
+                )
+                break
 
         self._load_instrument_details(details)
 
