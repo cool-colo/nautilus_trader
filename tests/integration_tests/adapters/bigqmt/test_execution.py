@@ -25,6 +25,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import GenerateFillReports
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
+from nautilus_trader.model.currencies import CNY
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
@@ -35,6 +36,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
@@ -367,6 +369,23 @@ def test_asset_update_republishes_when_valuation_changes():
 
     assert len(client.account_states) == 2
     assert client.account_states[-1]["info"] == changed_valuation
+
+
+def test_asset_update_derives_total_from_rounded_free_and_locked():
+    client = _StubExecClient()
+    asset = {
+        "cash": "1873921.824",
+        "frozen_cash": "297562.471",
+        "total_asset": "9213075.68",
+        "market_value": "7041622.00",
+    }
+
+    client._handle_asset_update(asset)
+
+    balance = client.account_states[-1]["balances"][0]
+    assert balance.free == Money("1873921.82", CNY)
+    assert balance.locked == Money("297562.47", CNY)
+    assert balance.total == Money("2171484.29", CNY)
 
 
 def test_submit_keeps_order_submitted_when_passorder_is_asynchronous():

@@ -595,11 +595,12 @@ class BigQMTExecutionClient(LiveExecutionClient):
         if not force and account_key == self._last_account_key:
             return
         self._last_account_key = account_key
-        total_cash = cash + frozen_cash
+        free = Money(cash, CNY)
+        locked = Money(frozen_cash, CNY)
         balance = AccountBalance(
-            total=Money(total_cash, CNY),
-            locked=Money(frozen_cash, CNY),
-            free=Money(cash, CNY),
+            total=free + locked,
+            locked=locked,
+            free=free,
         )
         self.generate_account_state(
             balances=[balance],
