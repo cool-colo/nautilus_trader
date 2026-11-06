@@ -19,6 +19,7 @@ from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_VENUE
 from nautilus_trader.adapters.bigqmt.providers import BigQMTInstrumentProviderConfig
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
+from nautilus_trader.config import NonNegativeFloat
 from nautilus_trader.config import PositiveFloat
 from nautilus_trader.config import PositiveInt
 from nautilus_trader.model.identifiers import Venue
@@ -108,6 +109,10 @@ class BigQMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
         Strategy name recorded on submitted orders.
     enforce_sellable_position : bool, default True
         If True, validates SELL orders against Big QMT ``can_use_volume`` before submitting.
+    account_cash_offset : NonNegativeFloat, default 0.0
+        Fixed amount of broker cash excluded from the Nautilus account view. The adapter
+        subtracts this amount from cash balances and total assets while retaining the
+        untouched broker asset payload in ``AccountState.info['raw_asset']``.
     poll_enabled : bool, default True
         If True, runs the order/trade/asset reconcile poll loop as a fallback
         alongside the real-time callback feed. Set False to rely solely on the
@@ -127,6 +132,7 @@ class BigQMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
     default_limit_price_type: PositiveInt = BIG_QMT_PRICE_TYPE_FIX_PRICE
     strategy_name: str = "nautilus"
     enforce_sellable_position: bool = True
+    account_cash_offset: NonNegativeFloat = 0.0
     poll_enabled: bool = True
     venue: Venue = BIG_QMT_VENUE
     instrument_provider: BigQMTInstrumentProviderConfig | None = None

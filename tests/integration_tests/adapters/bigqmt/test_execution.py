@@ -123,7 +123,15 @@ class _StubExecClient:
     generate_fill_reports = BigQMTExecutionClient.generate_fill_reports
     generate_position_status_reports = BigQMTExecutionClient.generate_position_status_reports
 
-    def __init__(self, positions=(), submit_response=None, orders=(), trades=(), submit_error=None):
+    def __init__(
+        self,
+        positions=(),
+        submit_response=None,
+        orders=(),
+        trades=(),
+        submit_error=None,
+        account_cash_offset=0.0,
+    ):
         self._client = _FakeClient(positions, submit_response, orders, trades, submit_error)
         self._log = _FakeLog()
         self._config = SimpleNamespace(
@@ -131,6 +139,7 @@ class _StubExecClient:
             default_market_price_type=5,
             enforce_sellable_position=False,
             strategy_name="test",
+            account_cash_offset=account_cash_offset,
         )
         self._last_account_key = None
         self._known_order_status = {}
@@ -386,6 +395,72 @@ def test_asset_update_derives_total_from_rounded_free_and_locked():
     assert balance.free == Money("1873921.82", CNY)
     assert balance.locked == Money("297562.47", CNY)
     assert balance.total == Money("2171484.29", CNY)
+
+
+def test_asset_update_applies_cash_offset_and_retains_raw_asset():
+    client = _StubExecClient(account_cash_offset=40.0)
+    asset = {
+        "cash": "100.00",
+        "frozen_cash": "10.00",
+        "total_asset": "1000.00",
+        "market_value": "890.00",
+    }
+
+    client._handle_asset_update(asset)
+
+    state = client.account_states[-1]
+    balance = state["balances"][0]
+    assert balance.total == Money(70, CNY)
+    assert balance.locked == Money(10, CNY)
+    assert balance.free == Money(60, CNY)
+    assert state["info"]["cash"] == "60.00"
+    assert state["info"]["available_cash"] == "60.00"
+    assert state["info"]["frozen_cash"] == "10.00"
+    assert state["info"]["total_asset"] == "960.00"
+    assert state["info"]["account_cash_offset"] == "40.0"
+    assert state["info"]["raw_asset"] == asset
+
+
+def test_asset_update_applies_remaining_cash_offset_to_frozen_cash():
+    client = _StubExecClient(account_cash_offset=40.0)
+
+    client._handle_asset_update(
+        {
+            "cash": "30.00",
+            "frozen_cash": "20.00",
+            "total_asset": "500.00",
+            "market_value": "450.00",
+        },
+    )
+
+    state = client.account_states[-1]
+    balance = state["balances"][0]
+    assert balance.total == Money(10, CNY)
+    assert balance.locked == Money(10, CNY)
+    assert balance.free == Money(0, CNY)
+    assert state["info"]["cash"] == "0"
+    assert state["info"]["frozen_cash"] == "10.00"
+
+
+def test_asset_update_rejects_cash_offset_above_total_cash_without_deduping():
+    client = _StubExecClient(account_cash_offset=40.0)
+    asset = {
+        "cash": "20.00",
+        "frozen_cash": "10.00",
+        "total_asset": "500.00",
+        "market_value": "470.00",
+    }
+
+    for _ in range(2):
+        try:
+            client._handle_asset_update(asset)
+        except ValueError as exc:
+            assert "exceeds broker cash plus frozen cash" in str(exc)
+        else:
+            raise AssertionError("expected invalid account_cash_offset to fail")
+
+    assert client.account_states == []
+    assert client._last_account_key is None
 
 
 def test_submit_keeps_order_submitted_when_passorder_is_asynchronous():

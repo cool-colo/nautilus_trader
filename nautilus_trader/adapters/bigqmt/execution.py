@@ -236,6 +236,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
         self._log.info(f"{config.account_id=}", LogColor.BLUE)
         self._log.info(f"{config.account_type=}", LogColor.BLUE)
         self._log.info(f"{config.poll_interval_secs=}", LogColor.BLUE)
+        self._log.info(f"{config.account_cash_offset=}", LogColor.BLUE)
 
     async def _connect(self) -> None:
         await self._client.connect()
@@ -594,20 +595,42 @@ class BigQMTExecutionClient(LiveExecutionClient):
         account_key = (cash, frozen_cash, total_asset, market_value)
         if not force and account_key == self._last_account_key:
             return
+        account_cash_offset = Decimal(str(self._config.account_cash_offset))
+        total_cash = cash + frozen_cash
+        if account_cash_offset > total_cash:
+            raise ValueError(
+                "BigQMT account_cash_offset exceeds broker cash plus frozen cash: "
+                f"offset={account_cash_offset}, cash={cash}, frozen_cash={frozen_cash}",
+            )
         self._last_account_key = account_key
-        free = Money(cash, CNY)
-        locked = Money(frozen_cash, CNY)
+        effective_total_cash = total_cash - account_cash_offset
+        effective_cash = max(cash - account_cash_offset, 0)
+        effective_frozen_cash = effective_total_cash - effective_cash
+        effective_total_asset = max(total_asset - account_cash_offset, 0)
+        free = Money(effective_cash, CNY)
+        locked = Money(effective_frozen_cash, CNY)
         balance = AccountBalance(
             total=free + locked,
             locked=locked,
             free=free,
         )
+        info = asset
+        if account_cash_offset > 0:
+            info = {
+                **asset,
+                "cash": str(effective_cash),
+                "available_cash": str(effective_cash),
+                "frozen_cash": str(effective_frozen_cash),
+                "total_asset": str(effective_total_asset),
+                "account_cash_offset": str(account_cash_offset),
+                "raw_asset": dict(asset),
+            }
         self.generate_account_state(
             balances=[balance],
             margins=[],
             reported=True,
             ts_event=self._clock.timestamp_ns(),
-            info=asset,
+            info=info,
         )
 
     def _handle_order_update(self, raw_order: dict[str, Any]) -> None:
