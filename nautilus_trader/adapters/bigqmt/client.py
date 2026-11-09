@@ -176,6 +176,19 @@ class BigQMTClient:
     async def unsubscribe_whole_quote(self, sub_id: int) -> int:
         return await self._run(self._xtdata.unsubscribe_quote, sub_id)
 
+    async def replay_whole_quote_subscriptions(self) -> bool:
+        """
+        Replay active whole-quote handles without creating new subscriptions.
+
+        Returns False when connected to an older BigQMT service which does not
+        expose explicit replay support.
+        """
+        replay = getattr(self._xtdata, "replay_whole_quote_subscriptions", None)
+        if replay is None:
+            return False
+        await self._run(replay)
+        return True
+
     async def get_market_data_ex(
         self,
         stock_list: list[str],

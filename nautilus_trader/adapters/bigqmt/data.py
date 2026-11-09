@@ -447,10 +447,6 @@ class BigQMTDataClient(LiveMarketDataClient):
                 self._push_retry_task = None
 
     def _ensure_push_monitor(self) -> None:
-        if self._config.poll_enabled:
-            return
-        if float(self._config.quote_push_fallback_poll_interval_secs) <= 0:
-            return
         if self._push_monitor_task is not None and not self._push_monitor_task.done():
             return
         task = self.create_task(
@@ -460,13 +456,62 @@ class BigQMTDataClient(LiveMarketDataClient):
         if task is not None:
             self._push_monitor_task = task
 
+    async def _replay_stale_quote_subscription(self, silence: float) -> None:
+        try:
+            replayed = await self._client.replay_whole_quote_subscriptions()
+            if replayed:
+                self._log.warning(
+                    "BigQMT quote push is stale; replayed existing subscriptions "
+                    f"silence_secs={silence:.1f}",
+                )
+            else:
+                self._log.warning(
+                    "BigQMT quote push is stale, but the connected service does not "
+                    "support explicit subscription replay",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log.warning(f"BigQMT quote push subscription replay failed: {exc}")
+
+    async def _poll_quote_push_fallback_if_due(
+        self,
+        silence: float,
+        now: float,
+        next_fallback_at: float,
+        fallback_interval: float,
+    ) -> float:
+        if self._config.poll_enabled or fallback_interval <= 0:
+            return next_fallback_at
+        if next_fallback_at and now < next_fallback_at:
+            return next_fallback_at
+        if not self._push_fallback_active:
+            self._push_fallback_active = True
+            self._log.warning(
+                "BigQMT quote push remains silent; entering batched full-tick fallback "
+                f"silence_secs={silence:.1f}",
+            )
+        try:
+            data = await self._client.get_full_tick(sorted(self._push_codes))
+            self._handle_full_tick_payload(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log.warning(f"BigQMT quote push fallback snapshot failed: {exc}")
+        return self._loop.time() + fallback_interval
+
     async def _monitor_quote_push(self) -> None:
         current_task = asyncio.current_task()
         stale_after = float(self._config.quote_push_stale_after_secs)
         fallback_interval = float(self._config.quote_push_fallback_poll_interval_secs)
         fallback_after = stale_after * 2.0
-        check_interval = min(stale_after, fallback_interval, 5.0)
+        check_interval = min(
+            stale_after,
+            fallback_interval if fallback_interval > 0 else stale_after,
+            5.0,
+        )
         next_fallback_at = 0.0
+        replayed_reference = None
         try:
             while True:
                 await asyncio.sleep(check_interval)
@@ -478,26 +523,18 @@ class BigQMTDataClient(LiveMarketDataClient):
                     self._push_subscription_started_at = reference
                 now = self._loop.time()
                 silence = now - reference
+                if silence >= stale_after and replayed_reference != reference:
+                    replayed_reference = reference
+                    await self._replay_stale_quote_subscription(silence)
                 if silence < fallback_after:
                     next_fallback_at = 0.0
                     continue
-                if next_fallback_at and now < next_fallback_at:
-                    continue
-                if not self._push_fallback_active:
-                    self._push_fallback_active = True
-                    self._log.warning(
-                        "BigQMT quote push remains silent; entering batched full-tick fallback "
-                        f"silence_secs={silence:.1f}",
-                    )
-                codes = sorted(self._push_codes)
-                try:
-                    data = await self._client.get_full_tick(codes)
-                    self._handle_full_tick_payload(data)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._log.warning(f"BigQMT quote push fallback snapshot failed: {exc}")
-                next_fallback_at = self._loop.time() + fallback_interval
+                next_fallback_at = await self._poll_quote_push_fallback_if_due(
+                    silence,
+                    now,
+                    next_fallback_at,
+                    fallback_interval,
+                )
         finally:
             if self._push_monitor_task is current_task:
                 self._push_monitor_task = None

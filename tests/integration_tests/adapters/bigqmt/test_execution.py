@@ -498,7 +498,7 @@ def test_submit_exception_keeps_order_submitted_as_outcome_unknown():
     assert client.has_unresolved_submission(order.client_order_id)
 
 
-def test_submit_maps_not_dispatched_to_denied():
+def test_submit_maps_not_dispatched_to_rejected_after_submission():
     client = _StubExecClient(
         submit_response={
             "status": "NOT_DISPATCHED",
@@ -512,8 +512,9 @@ def test_submit_maps_not_dispatched_to_denied():
 
     asyncio.run(client._submit_nautilus_order(order))
 
-    assert len(client.denied) == 1
-    assert client.rejected == []
+    assert len(client.rejected) == 1
+    assert client.denied == []
+    assert order.client_order_id in client._terminal_client_order_ids
     assert not client.has_unresolved_submission(order.client_order_id)
 
 

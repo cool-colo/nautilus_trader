@@ -78,6 +78,8 @@ class _StubDataClient:
 
 class _FallbackClient(_StubDataClient):
     _monitor_quote_push = BigQMTDataClient._monitor_quote_push
+    _poll_quote_push_fallback_if_due = BigQMTDataClient._poll_quote_push_fallback_if_due
+    _replay_stale_quote_subscription = BigQMTDataClient._replay_stale_quote_subscription
 
     def __init__(self):
         super().__init__()
@@ -85,16 +87,25 @@ class _FallbackClient(_StubDataClient):
         self._config = SimpleNamespace(
             quote_push_stale_after_secs=30.0,
             quote_push_fallback_poll_interval_secs=60.0,
+            poll_enabled=False,
         )
-        self._client = SimpleNamespace(get_full_tick=self._get_full_tick)
+        self._client = SimpleNamespace(
+            get_full_tick=self._get_full_tick,
+            replay_whole_quote_subscriptions=self._replay_whole_quote_subscriptions,
+        )
         self._push_codes = {"000002.SZ", "000001.SZ"}
         self._push_subscription_started_at = 0.0
         self._push_monitor_task = object()
         self.snapshot_requests = []
+        self.replay_requests = []
 
     async def _get_full_tick(self, codes):
         self.snapshot_requests.append(list(codes))
         return {}
+
+    async def _replay_whole_quote_subscriptions(self):
+        self.replay_requests.append(self._loop.time())
+        return True
 
 
 class _SubscriptionClient:
@@ -239,6 +250,7 @@ def test_push_monitor_batches_union_only_after_silence_and_stops_on_recovery(mon
     # triggers one batched snapshot at t=115; the t=120 push then stops the
     # fallback, and later healthy pushes prevent any additional polling.
     assert client.snapshot_requests == [["000001.SZ", "000002.SZ"]]
+    assert len(client.replay_requests) == 1
     assert client._push_fallback_active is False
     assert client._push_monitor_task is None
 

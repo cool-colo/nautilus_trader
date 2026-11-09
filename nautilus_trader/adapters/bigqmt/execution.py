@@ -342,7 +342,8 @@ class BigQMTExecutionClient(LiveExecutionClient):
 
         if submission_state == "NOT_DISPATCHED":
             self._pending_submissions.pop(order.client_order_id, None)
-            self.generate_order_denied(
+            self._terminal_client_order_ids.add(order.client_order_id)
+            self.generate_order_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
