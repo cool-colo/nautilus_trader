@@ -60,6 +60,13 @@ class BigQMTDataClientConfig(LiveDataClientConfig, frozen=True):
     poll_enabled : bool, default True
         If True, keeps the market-data poll loop running as a fallback alongside
         the push feed. Set False to rely solely on the push feed.
+    quote_push_stale_after_secs : PositiveFloat, default 30.0
+        Push silence threshold. The BigQMT subscription session replays its
+        subscriptions after this interval without a frame.
+    quote_push_fallback_poll_interval_secs : NonNegativeFloat, default 60.0
+        When push remains silent for at least twice ``quote_push_stale_after_secs``,
+        fetch one batched full-tick snapshot at this interval until push recovers.
+        Set to zero to disable the degraded-mode snapshot fallback.
     """
 
     account_id: str = ""
@@ -75,6 +82,8 @@ class BigQMTDataClientConfig(LiveDataClientConfig, frozen=True):
     adjust_type: str = "none"
     use_quote_push: bool = True
     poll_enabled: bool = True
+    quote_push_stale_after_secs: PositiveFloat = 30.0
+    quote_push_fallback_poll_interval_secs: NonNegativeFloat = 60.0
 
 
 class BigQMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):

@@ -53,9 +53,9 @@ class BigQMTDataClient(LiveMarketDataClient):
     """
     Live market data client for Chinese A-shares via the Big QMT RPC bridge.
 
-    Big QMT has no true streaming feed, so quote and bar subscriptions run a
-    polling loop against ``get_full_tick`` / ``get_market_data_ex`` at
-    ``poll_interval_secs``.
+    Quote and depth subscriptions use Big QMT's whole-quote push feed when
+    enabled. Bars remain polling-based. A batched full-tick snapshot is used only
+    as a degraded-mode fallback after prolonged push silence.
     """
 
     def __init__(
@@ -91,8 +91,15 @@ class BigQMTDataClient(LiveMarketDataClient):
         self._quote_push_supported = False
         self._push_codes: set[str] = set()
         self._push_sub_id: int | None = None
+        self._push_subscribed_codes: frozenset[str] = frozenset()
         self._push_quote_ids: set[InstrumentId] = set()
         self._push_depth_ids: set[InstrumentId] = set()
+        self._push_sync_lock = asyncio.Lock()
+        self._push_retry_task: asyncio.Task | None = None
+        self._push_monitor_task: asyncio.Task | None = None
+        self._push_subscription_started_at: float | None = None
+        self._push_last_received_at: float | None = None
+        self._push_fallback_active = False
 
         self._log.info(f"{config.redis_host=}", LogColor.BLUE)
         self._log.info(f"{config.redis_port=}", LogColor.BLUE)
@@ -101,6 +108,11 @@ class BigQMTDataClient(LiveMarketDataClient):
         self._log.info(f"{config.adjust_type=}", LogColor.BLUE)
         self._log.info(f"{config.use_quote_push=}", LogColor.BLUE)
         self._log.info(f"{config.poll_enabled=}", LogColor.BLUE)
+        self._log.info(f"{config.quote_push_stale_after_secs=}", LogColor.BLUE)
+        self._log.info(
+            f"{config.quote_push_fallback_poll_interval_secs=}",
+            LogColor.BLUE,
+        )
 
     async def _connect(self) -> None:
         await self._client.connect()
@@ -116,6 +128,15 @@ class BigQMTDataClient(LiveMarketDataClient):
         self._log.info(f"{self._quote_push_supported=}", LogColor.BLUE)
 
     async def _disconnect(self) -> None:
+        push_tasks = [
+            task
+            for task in (self._push_retry_task, self._push_monitor_task)
+            if task is not None
+        ]
+        for task in push_tasks:
+            task.cancel()
+        if push_tasks:
+            await asyncio.gather(*push_tasks, return_exceptions=True)
         for task in list(self._subscription_tasks.values()):
             task.cancel()
         self._subscription_tasks.clear()
@@ -126,8 +147,14 @@ class BigQMTDataClient(LiveMarketDataClient):
                 self._log.warning(f"BigQMT whole-quote unsubscribe failed on disconnect: {exc}")
             self._push_sub_id = None
         self._push_codes.clear()
+        self._push_subscribed_codes = frozenset()
         self._push_quote_ids.clear()
         self._push_depth_ids.clear()
+        self._push_retry_task = None
+        self._push_monitor_task = None
+        self._push_subscription_started_at = None
+        self._push_last_received_at = None
+        self._push_fallback_active = False
         await self._client.close()
 
     async def _subscribe(self, command: SubscribeData) -> None:
@@ -334,6 +361,7 @@ class BigQMTDataClient(LiveMarketDataClient):
             return
         self._push_codes.add(symbol)
         await self._sync_quote_subscription()
+        self._ensure_push_monitor()
 
     async def _maybe_drop_push_code(self, instrument_id: InstrumentId) -> None:
         # Keep the code while any quote OR depth subscriber still wants it.
@@ -354,27 +382,125 @@ class BigQMTDataClient(LiveMarketDataClient):
         """
         if not self._quote_push_supported:
             return
-        prev_sub_id = self._push_sub_id
-        if not self._push_codes:
-            self._push_sub_id = None
-            if prev_sub_id is not None:
+        async with self._push_sync_lock:
+            prev_sub_id = self._push_sub_id
+            if not self._push_codes:
+                await self._clear_quote_subscription(prev_sub_id)
+                return
+            codes = sorted(self._push_codes)
+            try:
+                sub_id = await self._client.subscribe_whole_quote(codes, self._on_quote_push)
+            except Exception as exc:
+                self._log.error(f"BigQMT whole-quote subscribe failed for {codes}: {exc}")
+                self._ensure_push_retry()
+                return
+            self._push_sub_id = sub_id
+            self._push_subscribed_codes = frozenset(codes)
+            if self._push_subscription_started_at is None:
+                self._push_subscription_started_at = self._loop.time()
+            if prev_sub_id is not None and prev_sub_id != sub_id:
                 try:
                     await self._client.unsubscribe_whole_quote(prev_sub_id)
                 except Exception as exc:
                     self._log.warning(f"BigQMT whole-quote unsubscribe failed: {exc}")
-            return
-        codes = sorted(self._push_codes)
-        try:
-            sub_id = await self._client.subscribe_whole_quote(codes, self._on_quote_push)
-        except Exception as exc:
-            self._log.error(f"BigQMT whole-quote subscribe failed for {codes}: {exc}")
-            return
-        self._push_sub_id = sub_id
-        if prev_sub_id is not None and prev_sub_id != sub_id:
+
+    async def _clear_quote_subscription(self, prev_sub_id: int | None) -> None:
+        current_task = asyncio.current_task()
+        for attr in ("_push_retry_task", "_push_monitor_task"):
+            task = getattr(self, attr)
+            if task is not None and task is not current_task:
+                task.cancel()
+                setattr(self, attr, None)
+        self._push_sub_id = None
+        self._push_subscribed_codes = frozenset()
+        self._push_subscription_started_at = None
+        self._push_last_received_at = None
+        self._push_fallback_active = False
+        if prev_sub_id is not None:
             try:
                 await self._client.unsubscribe_whole_quote(prev_sub_id)
             except Exception as exc:
                 self._log.warning(f"BigQMT whole-quote unsubscribe failed: {exc}")
+
+    def _ensure_push_retry(self) -> None:
+        if self._push_retry_task is not None and not self._push_retry_task.done():
+            return
+        task = self.create_task(
+            self._retry_quote_subscription(),
+            log_msg="bigqmt_quote_push_retry",
+        )
+        if task is not None:
+            self._push_retry_task = task
+
+    async def _retry_quote_subscription(self) -> None:
+        delay = 1.0
+        current_task = asyncio.current_task()
+        try:
+            while self._push_codes and self._push_subscribed_codes != frozenset(
+                self._push_codes,
+            ):
+                await asyncio.sleep(delay)
+                await self._sync_quote_subscription()
+                delay = min(delay * 2.0, 30.0)
+        finally:
+            if self._push_retry_task is current_task:
+                self._push_retry_task = None
+
+    def _ensure_push_monitor(self) -> None:
+        if self._config.poll_enabled:
+            return
+        if float(self._config.quote_push_fallback_poll_interval_secs) <= 0:
+            return
+        if self._push_monitor_task is not None and not self._push_monitor_task.done():
+            return
+        task = self.create_task(
+            self._monitor_quote_push(),
+            log_msg="bigqmt_quote_push_monitor",
+        )
+        if task is not None:
+            self._push_monitor_task = task
+
+    async def _monitor_quote_push(self) -> None:
+        current_task = asyncio.current_task()
+        stale_after = float(self._config.quote_push_stale_after_secs)
+        fallback_interval = float(self._config.quote_push_fallback_poll_interval_secs)
+        fallback_after = stale_after * 2.0
+        check_interval = min(stale_after, fallback_interval, 5.0)
+        next_fallback_at = 0.0
+        try:
+            while True:
+                await asyncio.sleep(check_interval)
+                if not self._push_codes:
+                    return
+                reference = self._push_last_received_at or self._push_subscription_started_at
+                if reference is None:
+                    reference = self._loop.time()
+                    self._push_subscription_started_at = reference
+                now = self._loop.time()
+                silence = now - reference
+                if silence < fallback_after:
+                    next_fallback_at = 0.0
+                    continue
+                if next_fallback_at and now < next_fallback_at:
+                    continue
+                if not self._push_fallback_active:
+                    self._push_fallback_active = True
+                    self._log.warning(
+                        "BigQMT quote push remains silent; entering batched full-tick fallback "
+                        f"silence_secs={silence:.1f}",
+                    )
+                codes = sorted(self._push_codes)
+                try:
+                    data = await self._client.get_full_tick(codes)
+                    self._handle_full_tick_payload(data)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log.warning(f"BigQMT quote push fallback snapshot failed: {exc}")
+                next_fallback_at = self._loop.time() + fallback_interval
+        finally:
+            if self._push_monitor_task is current_task:
+                self._push_monitor_task = None
 
     def _on_quote_push(self, data) -> None:
         # Invoked on the service's push subscriber thread (and once, inline, on
@@ -384,6 +510,14 @@ class BigQMTDataClient(LiveMarketDataClient):
         self._loop.call_soon_threadsafe(self._handle_quote_push, dict(data))
 
     def _handle_quote_push(self, data: dict) -> None:
+        if any(bool(value) for value in data.values()):
+            self._push_last_received_at = self._loop.time()
+            if self._push_fallback_active:
+                self._push_fallback_active = False
+                self._log.info("BigQMT quote push recovered; snapshot fallback stopped")
+        self._handle_full_tick_payload(data)
+
+    def _handle_full_tick_payload(self, data: dict) -> None:
         ts_init = self._clock.timestamp_ns()
         for code, tick_data in data.items():
             if not tick_data:
