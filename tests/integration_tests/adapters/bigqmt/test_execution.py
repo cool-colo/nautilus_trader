@@ -217,6 +217,26 @@ def test_parse_order_status_report_maps_bigqmt_fields():
     assert report.avg_px == Decimal(0)
 
 
+def test_parse_order_status_report_defaults_missing_price_type_to_limit():
+    report = _StubExecClient()._parse_order_status_report(
+        {
+            "stock_code": "000001.SZ",
+            "order_sysid": "7788",
+            "order_remark": "O-1",
+            "action": "BUY",
+            "order_volume": 100,
+            "traded_volume": 0,
+            "price": 12.34,
+            "traded_price": 0.0,
+            "order_status": 50,
+        },
+    )
+
+    assert report is not None
+    assert report.order_type == OrderType.LIMIT
+    assert str(report.price) == "12.34"
+
+
 def test_parse_order_status_report_uses_broker_order_time():
     order_time = int(datetime(2026, 9, 30, 1, 30, 9, tzinfo=UTC).timestamp())
     report = _StubExecClient()._parse_order_status_report(

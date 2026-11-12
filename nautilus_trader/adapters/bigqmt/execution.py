@@ -868,6 +868,9 @@ class BigQMTExecutionClient(LiveExecutionClient):
             return None
         client_order_id_value = _client_order_id_value(raw_order)
         client_order_id = ClientOrderId(client_order_id_value) if client_order_id_value else None
+        price_type = int(
+            raw_order.get("price_type") or self._config.default_limit_price_type,
+        )
         price = Decimal(str(raw_order.get("price", "0") or "0"))
         order_volume = int(raw_order.get("order_volume", 0) or 0)
         if order_volume <= 0:
@@ -881,7 +884,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
             venue_order_id=VenueOrderId(venue_order_id_value),
             client_order_id=client_order_id,
             order_side=self._order_side(raw_order),
-            order_type=qmt_order_type_from_price_type(int(raw_order.get("price_type", 0) or 0)),
+            order_type=qmt_order_type_from_price_type(price_type),
             time_in_force=TimeInForce.DAY,
             order_status=status,
             quantity=Quantity.from_int(order_volume),
