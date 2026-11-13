@@ -67,6 +67,10 @@ class BigQMTDataClientConfig(LiveDataClientConfig, frozen=True):
         When push remains silent for at least twice ``quote_push_stale_after_secs``,
         fetch one batched full-tick snapshot at this interval until push recovers.
         Set to zero to disable the degraded-mode snapshot fallback.
+    tick_trace_enabled : bool, default False
+        Publish local ``BigQMTTickTrace`` events after quote/depth delivery.
+        Raw ticks still carry bridge timestamps when disabled. Subscriber
+        callbacks run synchronously, so keep diagnostic handlers short.
     """
 
     account_id: str = ""
@@ -84,6 +88,7 @@ class BigQMTDataClientConfig(LiveDataClientConfig, frozen=True):
     poll_enabled: bool = True
     quote_push_stale_after_secs: PositiveFloat = 30.0
     quote_push_fallback_poll_interval_secs: NonNegativeFloat = 60.0
+    tick_trace_enabled: bool = False
 
 
 class BigQMTExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):

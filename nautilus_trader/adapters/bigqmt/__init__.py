@@ -22,6 +22,7 @@ from nautilus_trader.adapters.bigqmt.factories import BigQMTLiveDataClientFactor
 from nautilus_trader.adapters.bigqmt.factories import BigQMTLiveExecClientFactory
 from nautilus_trader.adapters.bigqmt.providers import BigQMTInstrumentProvider
 from nautilus_trader.adapters.bigqmt.providers import BigQMTInstrumentProviderConfig
+from nautilus_trader.adapters.bigqmt.tick_trace import BigQMTTickTrace
 
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "BigQMTInstrumentProviderConfig",
     "BigQMTLiveDataClientFactory",
     "BigQMTLiveExecClientFactory",
+    "BigQMTTickTrace",
 ]

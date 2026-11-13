@@ -61,9 +61,13 @@ class _FakeLog:
 class _StubDataClient:
     _handle_quote_push = BigQMTDataClient._handle_quote_push
     _handle_full_tick_payload = BigQMTDataClient._handle_full_tick_payload
+    _on_quote_push = BigQMTDataClient._on_quote_push
+    _publish_tick_trace = BigQMTDataClient._publish_tick_trace
+    _publish_tick_traces = BigQMTDataClient._publish_tick_traces
 
     def __init__(self):
         self._log = _FakeLog()
+        self._config = SimpleNamespace(tick_trace_enabled=False)
         self._clock = _FakeClock()
         self._loop = _FakeLoop()
         self._push_quote_ids = set()
@@ -88,6 +92,7 @@ class _FallbackClient(_StubDataClient):
             quote_push_stale_after_secs=30.0,
             quote_push_fallback_poll_interval_secs=60.0,
             poll_enabled=False,
+            tick_trace_enabled=False,
         )
         self._client = SimpleNamespace(
             get_full_tick=self._get_full_tick,
@@ -303,3 +308,162 @@ def test_lookup_symbol_case_insensitive():
     assert _lookup_symbol(data, "000001.SZ") == {"time": 1}
     assert _lookup_symbol(data, "000001.sz") == {"time": 1}
     assert _lookup_symbol(data, "000001.SH") is None
+
+
+def _traced_payload():
+    payload = _full_tick_payload()
+    payload["_trace"] = {
+        "qmt_callback_ns": 10,
+        "pipe_publish_ns": 20,
+        "proxy_pipe_received_ns": 30,
+        "redis_publish_ns": 40,
+        "adapter_redis_received_ns": 50,
+        "adapter_callback_ns": 60,
+    }
+    return {"000001.SZ": payload}
+
+
+class _TraceBus:
+    def __init__(self, client, fail=False):
+        self.client = client
+        self.fail = fail
+        self.events = []
+
+    def publish(self, topic, msg, external_pub):
+        # The entire batch must reach normal delivery before diagnostics run.
+        self.events.append((topic, msg, external_pub, len(self.client.handled)))
+        if self.fail:
+            raise RuntimeError("diagnostic subscriber failed")
+
+
+def test_tick_trace_config_is_disabled_by_default():
+    from nautilus_trader.adapters.bigqmt.config import BigQMTDataClientConfig
+
+    assert BigQMTDataClientConfig().tick_trace_enabled is False
+
+
+def test_disabled_tick_trace_skips_clock_construction_and_publish(monkeypatch):
+    client = _StubDataClient()
+    client._push_quote_ids.add(INSTRUMENT_ID)
+    client._loop.call_soon_threadsafe = lambda callback, data: callback(data)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("disabled diagnostic path was entered")
+
+    monkeypatch.setattr("nautilus_trader.adapters.bigqmt.data.time.time_ns", unexpected)
+    monkeypatch.setattr("nautilus_trader.adapters.bigqmt.data.BigQMTTickTrace", unexpected)
+    client._publish_tick_trace = unexpected
+    client._on_quote_push(_traced_payload())
+    assert len(client.handled) == 1
+
+
+def test_tick_trace_preserves_original_event_and_init_for_quote_and_depth():
+    from dataclasses import FrozenInstanceError
+
+    from nautilus_trader.adapters.bigqmt.tick_trace import BigQMTTickTrace
+
+    client = _StubDataClient()
+    client._config.tick_trace_enabled = True
+    client._msgbus = _TraceBus(client)
+    client._push_quote_ids.add(INSTRUMENT_ID)
+    client._push_depth_ids.add(INSTRUMENT_ID)
+    client._handle_quote_push(_traced_payload())
+
+    assert len(client._msgbus.events) == 2
+    for market_data, (topic, event, external_pub, delivered_count) in zip(
+        client.handled, client._msgbus.events, strict=True,
+    ):
+        assert isinstance(event, BigQMTTickTrace)
+        assert topic == f"bigqmt.tick_trace.{INSTRUMENT_ID}"
+        assert external_pub is False
+        assert delivered_count == 2
+        assert event.ts_event == market_data.ts_event == 1700000000000000000
+        assert event.ts_init == market_data.ts_init == 123
+        assert event.instrument_id == str(market_data.instrument_id)
+        assert event.qmt_callback_ns == 10
+        assert event.pipe_publish_ns == 20
+        assert event.proxy_pipe_received_ns == 30
+        assert event.redis_publish_ns == 40
+        assert event.adapter_redis_received_ns == 50
+        assert event.adapter_callback_ns == 60
+        with pytest.raises(FrozenInstanceError):
+            event.ts_event = 0
+    assert [item[1].data_kind for item in client._msgbus.events] == ["quote", "depth10"]
+
+
+def test_callback_trace_is_captured_before_event_loop_without_mutating_input(monkeypatch):
+    from copy import deepcopy
+
+    client = _StubDataClient()
+    client._config.tick_trace_enabled = True
+    queued = []
+    client._loop.call_soon_threadsafe = lambda callback, data: queued.append((callback, data))
+    monkeypatch.setattr("nautilus_trader.adapters.bigqmt.data.time.time_ns", lambda: 999)
+    payload = _traced_payload()
+    original = deepcopy(payload)
+    client._on_quote_push(payload)
+    assert payload == original
+    assert len(queued) == 1
+    assert queued[0][1]["000001.SZ"]["_trace"]["adapter_callback_ns"] == 999
+
+
+@pytest.mark.parametrize("trace", [None, "invalid", [], False])
+def test_tick_trace_ignores_legacy_and_malformed_trace(trace):
+    client = _StubDataClient()
+    client._config.tick_trace_enabled = True
+    client._msgbus = _TraceBus(client)
+    client._push_quote_ids.add(INSTRUMENT_ID)
+    payload = _full_tick_payload()
+    if trace is not None:
+        payload["_trace"] = trace
+    client._handle_full_tick_payload({"000001.SZ": payload})
+    assert len(client.handled) == 1
+    assert client._msgbus.events == []
+
+
+def test_tick_trace_keeps_missing_and_invalid_timestamps_as_none():
+    client = _StubDataClient()
+    client._config.tick_trace_enabled = True
+    client._msgbus = _TraceBus(client)
+    client._push_quote_ids.add(INSTRUMENT_ID)
+    payload = _traced_payload()
+    payload["000001.SZ"]["_trace"] = {
+        "qmt_callback_ns": 10, "pipe_publish_ns": "20", "redis_publish_ns": True,
+        "proxy_pipe_received_ns": -1, "adapter_callback_ns": 0,
+    }
+    client._handle_quote_push(payload)
+    event = client._msgbus.events[0][1]
+    assert event.qmt_callback_ns == 10
+    assert event.pipe_publish_ns is None
+    assert event.proxy_pipe_received_ns is None
+    assert event.redis_publish_ns is None
+    assert event.adapter_redis_received_ns is None
+    assert event.adapter_callback_ns is None
+
+
+def test_diagnostic_subscriber_failure_does_not_stop_normal_or_later_delivery():
+    client = _StubDataClient()
+    client._config.tick_trace_enabled = True
+    client._msgbus = _TraceBus(client, fail=True)
+    client._push_quote_ids.add(INSTRUMENT_ID)
+    client._push_depth_ids.add(INSTRUMENT_ID)
+    client._handle_quote_push(_traced_payload())
+    client._handle_quote_push(_traced_payload())
+    assert len(client.handled) == 4
+    assert len(client._msgbus.events) == 4
+
+
+def test_tick_trace_works_on_real_message_bus():
+    from nautilus_trader.common.component import LiveClock
+    from nautilus_trader.common.component import MessageBus
+    from nautilus_trader.model.identifiers import TraderId
+
+    client = _StubDataClient()
+    client._config.tick_trace_enabled = True
+    client._push_depth_ids.add(INSTRUMENT_ID)
+    client._msgbus = MessageBus(trader_id=TraderId("TRACE-001"), clock=LiveClock())
+    events = []
+    client._msgbus.subscribe(topic="bigqmt.tick_trace.*", handler=events.append)
+    client._handle_quote_push(_traced_payload())
+    assert len(events) == 1
+    assert events[0].ts_event == client.handled[0].ts_event

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from nautilus_trader.adapters.bigqmt.client import BigQMTClient
 from nautilus_trader.adapters.bigqmt.common import bar_type_to_qmt_period
@@ -27,6 +28,8 @@ from nautilus_trader.adapters.bigqmt.common import parse_full_tick_as_quote_tick
 from nautilus_trader.adapters.bigqmt.config import BigQMTDataClientConfig
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_VENUE
 from nautilus_trader.adapters.bigqmt.providers import BigQMTInstrumentProvider
+from nautilus_trader.adapters.bigqmt.tick_trace import BigQMTTickTrace
+from nautilus_trader.adapters.bigqmt.tick_trace import trace_timestamp
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -108,6 +111,7 @@ class BigQMTDataClient(LiveMarketDataClient):
         self._log.info(f"{config.adjust_type=}", LogColor.BLUE)
         self._log.info(f"{config.use_quote_push=}", LogColor.BLUE)
         self._log.info(f"{config.poll_enabled=}", LogColor.BLUE)
+        self._log.info(f"{config.tick_trace_enabled=}", LogColor.BLUE)
         self._log.info(f"{config.quote_push_stale_after_secs=}", LogColor.BLUE)
         self._log.info(
             f"{config.quote_push_fallback_poll_interval_secs=}",
@@ -540,11 +544,19 @@ class BigQMTDataClient(LiveMarketDataClient):
                 self._push_monitor_task = None
 
     def _on_quote_push(self, data) -> None:
+        received_ns = time.time_ns() if self._config.tick_trace_enabled else None
         # Invoked on the service's push subscriber thread (and once, inline, on
         # the RPC executor thread for the prime snapshot). Marshal onto the loop.
         if not isinstance(data, dict):
             return
-        self._loop.call_soon_threadsafe(self._handle_quote_push, dict(data))
+        data = dict(data)
+        if received_ns is not None:
+            for code, tick in data.items():
+                if isinstance(tick, dict) and isinstance(tick.get("_trace"), dict):
+                    copied = dict(tick)
+                    copied["_trace"] = dict(tick["_trace"], adapter_callback_ns=received_ns)
+                    data[code] = copied
+        self._loop.call_soon_threadsafe(self._handle_quote_push, data)
 
     def _handle_quote_push(self, data: dict) -> None:
         if any(bool(value) for value in data.values()):
@@ -556,6 +568,7 @@ class BigQMTDataClient(LiveMarketDataClient):
 
     def _handle_full_tick_payload(self, data: dict) -> None:
         ts_init = self._clock.timestamp_ns()
+        pending_traces = [] if self._config.tick_trace_enabled else None
         for code, tick_data in data.items():
             if not tick_data:
                 continue
@@ -572,6 +585,8 @@ class BigQMTDataClient(LiveMarketDataClient):
                 )
                 if tick is not None:
                     self._handle_data(tick)
+                    if pending_traces is not None:
+                        pending_traces.append((tick, "quote", tick_data))
             if instrument_id in self._push_depth_ids:
                 depth = parse_full_tick_as_order_book_depth10(
                     instrument_id=instrument_id,
@@ -580,6 +595,44 @@ class BigQMTDataClient(LiveMarketDataClient):
                 )
                 if depth is not None:
                     self._handle_data(depth)
+                    if pending_traces is not None:
+                        pending_traces.append((depth, "depth10", tick_data))
+        # Finish normal delivery for the entire batch before diagnostic handlers
+        # run. Disabled tracing allocates neither events nor a pending list.
+        self._publish_tick_traces(pending_traces)
+
+    def _publish_tick_traces(self, pending_traces: list | None) -> None:
+        if pending_traces is None:
+            return
+        for market_data, data_kind, payload in pending_traces:
+            self._publish_tick_trace(market_data, data_kind, payload)
+
+    def _publish_tick_trace(self, market_data, data_kind: str, payload: dict) -> None:
+        try:
+            trace = payload.get("_trace")
+            if not isinstance(trace, dict):
+                return
+            event = BigQMTTickTrace(
+                instrument_id=str(market_data.instrument_id),
+                data_kind=data_kind,
+                ts_event=int(market_data.ts_event),
+                ts_init=int(market_data.ts_init),
+                qmt_callback_ns=trace_timestamp(trace, "qmt_callback_ns"),
+                pipe_publish_ns=trace_timestamp(trace, "pipe_publish_ns"),
+                proxy_pipe_received_ns=trace_timestamp(trace, "proxy_pipe_received_ns"),
+                redis_publish_ns=trace_timestamp(trace, "redis_publish_ns"),
+                adapter_redis_received_ns=trace_timestamp(trace, "adapter_redis_received_ns"),
+                adapter_callback_ns=trace_timestamp(trace, "adapter_callback_ns"),
+            )
+            self._msgbus.publish(
+                topic=f"bigqmt.tick_trace.{event.instrument_id}",
+                msg=event,
+                external_pub=False,
+            )
+        except Exception:
+            # Diagnostics (including subscriber exceptions) must never abort
+            # market data processing. Do not emit per-tick failure logs here.
+            return
 
     def _dataframe_to_bars(self, bar_type: BarType, symbol: str, data: dict) -> list:
         df = _lookup_symbol(data, symbol)
