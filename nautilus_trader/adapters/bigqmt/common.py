@@ -23,6 +23,8 @@ defined here.
 
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_ORDER_CANCELED
@@ -58,6 +60,7 @@ from nautilus_trader.adapters.qmt.common import quantity_to_int
 from nautilus_trader.adapters.qmt.common import timestamp_to_qmt_str
 from nautilus_trader.adapters.qmt.equity_quantity_rules import a_share_limit_order_quantity_rules
 from nautilus_trader.model.currencies import CNY
+from nautilus_trader.model.data import NULL_ORDER
 from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model.data import QuoteTick
@@ -300,69 +303,77 @@ def parse_full_tick_as_order_book_depth10(
     instrument_id: InstrumentId,
     payload: dict[str, object],
     ts_init: int,
+    diagnostics: list[str] | None = None,
 ) -> OrderBookDepth10 | None:
     """
     Parse a Big QMT ``get_full_tick`` payload into an ``OrderBookDepth10``.
 
-    Mirrors ``qmt.common.parse_order_book_depth10`` but reads Big QMT's native
-    camelCase field names (``bidPrice``/``askPrice``/``bidVol``/``askVol``/``time``)
-    rather than the ``quant-qmt-proxy`` snake_case schema. The same
-    ``get_full_tick`` payload that feeds the quote poll carries all book levels,
-    so no additional RPC is required.
+    Parse each side independently so price-limit, single-sided books are
+    delivered as fresh snapshots. Missing levels use Nautilus null orders.
+    Optional diagnostics describe malformed sides without rejecting a valid
+    opposite side. Normal empty sides and zero tail levels are not errors.
     """
-    bid_prices = payload.get("bidPrice") or []
-    ask_prices = payload.get("askPrice") or []
-    bid_volumes = payload.get("bidVol") or []
-    ask_volumes = payload.get("askVol") or []
-    depth = min(len(bid_prices), len(ask_prices), len(bid_volumes), len(ask_volumes), 10)
-    if depth <= 0:
+    bids = _parse_full_tick_book_side(payload, "bidPrice", "bidVol", OrderSide.BUY, 1, diagnostics)
+    asks = _parse_full_tick_book_side(payload, "askPrice", "askVol", OrderSide.SELL, 11, diagnostics)
+    depth = max(len(bids), len(asks))
+    if depth == 0:
+        if diagnostics is not None:
+            diagnostics.append("no_valid_book_levels")
         return None
-
-    bids: list[BookOrder] = []
-    asks: list[BookOrder] = []
-    bid_counts: list[int] = []
-    ask_counts: list[int] = []
-    for level in range(depth):
-        try:
-            bid_price = float(bid_prices[level] or 0.0)
-            ask_price = float(ask_prices[level] or 0.0)
-            bid_volume = int(bid_volumes[level] or 0)
-            ask_volume = int(ask_volumes[level] or 0)
-        except (TypeError, ValueError):
-            break
-        if bid_price <= 0 or ask_price <= 0 or bid_volume <= 0 or ask_volume <= 0:
-            break
-        bids.append(
-            BookOrder(
-                side=OrderSide.BUY,
-                price=Price.from_str(f"{bid_price:.2f}"),
-                size=Quantity.from_int(bid_volume),
-                order_id=level + 1,
-            ),
-        )
-        asks.append(
-            BookOrder(
-                side=OrderSide.SELL,
-                price=Price.from_str(f"{ask_price:.2f}"),
-                size=Quantity.from_int(ask_volume),
-                order_id=level + 11,
-            ),
-        )
-        # QMT tick depth gives aggregate level volume, not per-level order count.
-        bid_counts.append(0)
-        ask_counts.append(0)
-
-    if not bids:
-        return None
+    bids.extend([NULL_ORDER] * (depth - len(bids)))
+    asks.extend([NULL_ORDER] * (depth - len(asks)))
     ts_event = millis_to_nanos(payload.get("time")) or ts_init
     return OrderBookDepth10(
         instrument_id=instrument_id,
         bids=bids,
         asks=asks,
-        bid_counts=bid_counts,
-        ask_counts=ask_counts,
+        bid_counts=[0] * depth,
+        ask_counts=[0] * depth,
         flags=0,
         sequence=0,
         ts_event=ts_event,
         ts_init=ts_init,
     )
+
+
+def _parse_full_tick_book_side(
+    payload: dict[str, object],
+    price_field: str,
+    volume_field: str,
+    side: OrderSide,
+    order_id_offset: int,
+    diagnostics: list[str] | None,
+) -> list[BookOrder]:
+    prices = payload.get(price_field)
+    volumes = payload.get(volume_field)
+    if prices is None or volumes is None:
+        return []
+    orders: list[BookOrder] = []
+    try:
+        if isinstance(prices, (str, bytes, dict)) or isinstance(volumes, (str, bytes, dict)):
+            raise ValueError("expected price and volume arrays")
+        depth = min(len(prices), len(volumes), 10)
+        if len(prices) != len(volumes) and diagnostics is not None:
+            diagnostics.append(f"{price_field}:length_mismatch")
+        for level in range(depth):
+            price = float(prices[level])
+            volume_value = float(volumes[level])
+            if not math.isfinite(price) or not math.isfinite(volume_value):
+                raise ValueError(f"non_finite_level:{level}")
+            if price < 0 or volume_value < 0:
+                raise ValueError(f"negative_level:{level}")
+            volume = int(volumes[level])
+            if price == 0 or volume == 0:
+                break
+            orders.append(
+                BookOrder(
+                    side=side,
+                    price=Price.from_str(f"{price:.2f}"),
+                    size=Quantity.from_int(volume),
+                    order_id=level + order_id_offset,
+                ),
+            )
+    except (TypeError, ValueError, OverflowError) as exc:
+        if diagnostics is not None:
+            diagnostics.append(f"{price_field}:{type(exc).__name__}:{exc}")
+    return orders

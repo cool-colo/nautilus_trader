@@ -212,7 +212,7 @@ def test_parse_full_tick_as_order_book_depth10_truncates_at_non_positive_level()
         {
             "bidPrice": [10.49, 10.48, 10.47],
             "askPrice": [10.51, 10.52, 10.53],
-            # Second level has zero volume -> depth truncates to a single level.
+            # Only the bid side truncates at its second zero-volume level.
             "bidVol": [100, 0, 300],
             "askVol": [110, 210, 310],
             "time": 1733118954000,
@@ -223,7 +223,7 @@ def test_parse_full_tick_as_order_book_depth10_truncates_at_non_positive_level()
     assert str(depth.bids[0].price) == "10.49"
     # Level 2 dropped -> padded to null.
     assert depth.bids[1].price.as_double() == 0
-    assert depth.asks[1].price.as_double() == 0
+    assert depth.asks[1].price.as_double() == 10.52
 
 
 def test_bigqmt_traded_at_to_nanos_full_datetime():
@@ -271,3 +271,65 @@ def test_bigqmt_traded_at_to_nanos_stable_across_calls():
 @pytest.mark.parametrize("value", [None, "", "   ", "not-a-time"])
 def test_bigqmt_traded_at_to_nanos_unparseable_returns_zero(value):
     assert bigqmt_traded_at_to_nanos(value) == 0
+
+
+@pytest.mark.parametrize("empty_side", ["bid", "ask"])
+@pytest.mark.parametrize("empty_shape", ["missing", "empty", "zeros"])
+def test_depth_accepts_single_sided_price_limit_book(empty_side, empty_shape):
+    payload = {"bidPrice": [10.00, 9.99], "bidVol": [100, 200],
+               "askPrice": [10.01, 10.02], "askVol": [110, 210], "time": 1000}
+    for field in (empty_side + "Price", empty_side + "Vol"):
+        if empty_shape == "missing":
+            payload.pop(field)
+        else:
+            payload[field] = [] if empty_shape == "empty" else [0, 0]
+    diagnostics = []
+    depth = parse_full_tick_as_order_book_depth10(INSTRUMENT_ID, payload, 2, diagnostics)
+    assert depth is not None
+    assert diagnostics == []
+    empty = depth.bids if empty_side == "bid" else depth.asks
+    valid = depth.asks if empty_side == "bid" else depth.bids
+    assert all(level.price.as_double() == 0 for level in empty)
+    assert valid[1].size.as_double() > 0
+    assert depth.ts_event == 1000 * 1_000_000
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1, "bad"])
+def test_malformed_side_keeps_valid_opposite_side_with_reason(bad):
+    diagnostics = []
+    depth = parse_full_tick_as_order_book_depth10(
+        INSTRUMENT_ID, {"bidPrice": [bad], "bidVol": [100],
+                        "askPrice": [10.01], "askVol": [110]}, 2, diagnostics)
+    assert depth is not None
+    assert depth.bids[0].price.as_double() == 0
+    assert depth.asks[0].price.as_double() == 10.01
+    assert any(reason.startswith("bidPrice:") for reason in diagnostics)
+
+
+def test_single_sided_snapshot_clears_previous_opposite_side_in_real_book():
+    from nautilus_trader.model.book import OrderBook
+    from nautilus_trader.model.enums import BookType
+
+    book = OrderBook(INSTRUMENT_ID, BookType.L2_MBP)
+    payload = {"bidPrice": [10.00], "bidVol": [100],
+               "askPrice": [10.01], "askVol": [110], "time": 1000}
+    book.apply_depth(parse_full_tick_as_order_book_depth10(INSTRUMENT_ID, payload, 2))
+    assert book.best_bid_price() is not None
+    assert book.best_ask_price() is not None
+    payload.update(askPrice=[], askVol=[], time=2000)
+    book.apply_depth(parse_full_tick_as_order_book_depth10(INSTRUMENT_ID, payload, 3))
+    assert book.best_bid_price() is not None
+    assert book.best_ask_price() is None
+    payload.update(bidPrice=[], bidVol=[], askPrice=[10.01], askVol=[110], time=3000)
+    book.apply_depth(parse_full_tick_as_order_book_depth10(INSTRUMENT_ID, payload, 4))
+    assert book.best_bid_price() is None
+    assert book.best_ask_price() is not None
+
+
+def test_depth_parses_numpy_arrays_without_ambiguous_truth_value():
+    import numpy as np
+    depth = parse_full_tick_as_order_book_depth10(
+        INSTRUMENT_ID, {"bidPrice": np.array([10.0, 9.99]), "bidVol": np.array([1, 2]),
+                        "askPrice": np.array([]), "askVol": np.array([])}, 2)
+    assert depth is not None
+    assert depth.bids[1].size.as_double() == 2

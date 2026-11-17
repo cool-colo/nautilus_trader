@@ -59,6 +59,8 @@ class _FakeLog:
 
 
 class _StubDataClient:
+    _report_push_issue = BigQMTDataClient._report_push_issue
+    _deliver_full_tick = BigQMTDataClient._deliver_full_tick
     _handle_quote_push = BigQMTDataClient._handle_quote_push
     _handle_full_tick_payload = BigQMTDataClient._handle_full_tick_payload
     _on_quote_push = BigQMTDataClient._on_quote_push
@@ -74,6 +76,8 @@ class _StubDataClient:
         self._push_depth_ids = set()
         self._push_last_received_at = None
         self._push_fallback_active = False
+        self._push_issue_counts = {}
+        self._push_issue_last_log = {}
         self.handled = []
 
     def _handle_data(self, data):
@@ -451,6 +455,8 @@ def test_diagnostic_subscriber_failure_does_not_stop_normal_or_later_delivery():
     client._handle_quote_push(_traced_payload())
     assert len(client.handled) == 4
     assert len(client._msgbus.events) == 4
+    assert client._push_issue_counts[("quote", "trace")] == 2
+    assert client._push_issue_counts[("depth10", "trace")] == 2
 
 
 def test_tick_trace_works_on_real_message_bus():
@@ -467,3 +473,59 @@ def test_tick_trace_works_on_real_message_bus():
     client._handle_quote_push(_traced_payload())
     assert len(events) == 1
     assert events[0].ts_event == client.handled[0].ts_event
+
+
+
+def test_bad_stock_does_not_abort_later_stock_or_opposite_data_kind():
+    client = _StubDataClient()
+    second = InstrumentId.from_str("000002.SZ.BIGQMT")
+    client._push_quote_ids.update([INSTRUMENT_ID, second])
+    client._push_depth_ids.update([INSTRUMENT_ID, second])
+    bad = _full_tick_payload()
+    bad["bidVol"] = [float("inf")]
+    client._handle_quote_push({"000001.SZ": bad, "000002.SZ": _full_tick_payload()})
+    assert any(isinstance(data, OrderBookDepth10) and data.instrument_id == INSTRUMENT_ID
+               for data in client.handled)
+    assert len([data for data in client.handled if data.instrument_id == second]) == 2
+    assert client._push_issue_counts[("quote", "parse")] == 1
+
+
+def test_delivery_failure_does_not_abort_other_kind_or_stock():
+    client = _StubDataClient()
+    second = InstrumentId.from_str("000002.SZ.BIGQMT")
+    client._push_quote_ids.update([INSTRUMENT_ID, second])
+    client._push_depth_ids.update([INSTRUMENT_ID, second])
+    def deliver(data):
+        if isinstance(data, QuoteTick) and data.instrument_id == INSTRUMENT_ID:
+            raise RuntimeError("delivery failed")
+        client.handled.append(data)
+    client._handle_data = deliver
+    client._handle_quote_push({"000001.SZ": _full_tick_payload(), "000002.SZ": _full_tick_payload()})
+    assert len(client.handled) == 3
+    assert client._push_issue_counts[("quote", "deliver")] == 1
+
+
+def test_malformed_payload_does_not_abort_batch_and_logs_are_throttled():
+    client = _StubDataClient()
+    client._push_depth_ids.add(INSTRUMENT_ID)
+    for _ in range(20):
+        client._handle_quote_push({"bad": [1, 2], "000001.SZ": _full_tick_payload()})
+    assert len(client.handled) == 20
+    assert client._push_issue_counts[("payload", "validate")] == 20
+    assert len(client._log.warnings) == 3
+
+
+def test_trace_failure_does_not_abort_remaining_traces():
+    client = _StubDataClient()
+    client._config.tick_trace_enabled = True
+    client._push_quote_ids.add(INSTRUMENT_ID)
+    client._push_depth_ids.add(INSTRUMENT_ID)
+    seen = []
+    def publish_trace(data, kind, payload):
+        seen.append(kind)
+        if kind == "quote":
+            raise RuntimeError("diagnostic failed")
+    client._publish_tick_trace = publish_trace
+    client._handle_quote_push({"000001.SZ": _full_tick_payload()})
+    assert len(client.handled) == 2
+    assert seen == ["quote", "depth10"]

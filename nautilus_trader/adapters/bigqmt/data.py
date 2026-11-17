@@ -104,6 +104,9 @@ class BigQMTDataClient(LiveMarketDataClient):
         self._push_last_received_at: float | None = None
         self._push_fallback_active = False
 
+        self._push_issue_counts: dict[tuple[str, str], int] = {}
+        self._push_issue_last_log: dict[tuple[str, str], float] = {}
+
         self._log.info(f"{config.redis_host=}", LogColor.BLUE)
         self._log.info(f"{config.redis_port=}", LogColor.BLUE)
         self._log.info(f"{config.transport=}", LogColor.BLUE)
@@ -559,53 +562,92 @@ class BigQMTDataClient(LiveMarketDataClient):
         self._loop.call_soon_threadsafe(self._handle_quote_push, data)
 
     def _handle_quote_push(self, data: dict) -> None:
-        if any(bool(value) for value in data.values()):
+        if any(isinstance(value, dict) and value for value in data.values()):
             self._push_last_received_at = self._loop.time()
             if self._push_fallback_active:
                 self._push_fallback_active = False
                 self._log.info("BigQMT quote push recovered; snapshot fallback stopped")
         self._handle_full_tick_payload(data)
 
+    def _report_push_issue(self, code: object, data_kind: str, stage: str, reason: str) -> None:
+        key = (data_kind, stage)
+        count = self._push_issue_counts.get(key, 0) + 1
+        self._push_issue_counts[key] = count
+        now = self._loop.time()
+        if count <= 3 or now - self._push_issue_last_log.get(key, now) >= 60.0:
+            self._push_issue_last_log[key] = now
+            self._log.warning(
+                f"BigQMT quote push issue: code={code!r}, data_kind={data_kind}, "
+                f"stage={stage}, count={count}, reason={reason}",
+            )
+
     def _handle_full_tick_payload(self, data: dict) -> None:
         ts_init = self._clock.timestamp_ns()
         pending_traces = [] if self._config.tick_trace_enabled else None
         for code, tick_data in data.items():
+            if not isinstance(tick_data, dict):
+                self._report_push_issue(code, "payload", "validate", "expected_tick_dict")
+                continue
             if not tick_data:
+                self._report_push_issue(code, "payload", "validate", "empty_tick")
                 continue
             try:
                 instrument_id = bigqmt_symbol_to_instrument_id(str(code))
             except Exception as exc:
-                self._log.warning(f"BigQMT quote push: cannot map code {code!r}: {exc}")
+                self._report_push_issue(code, "payload", "map", f"{type(exc).__name__}:{exc}")
                 continue
-            if instrument_id in self._push_quote_ids:
-                tick = parse_full_tick_as_quote_tick(
-                    instrument_id=instrument_id,
-                    payload=tick_data,
-                    ts_init=ts_init,
+            for data_kind, wanted in (
+                ("quote", self._push_quote_ids),
+                ("depth10", self._push_depth_ids),
+            ):
+                if instrument_id not in wanted:
+                    continue
+                self._deliver_full_tick(
+                    code, instrument_id, tick_data, ts_init, data_kind, pending_traces,
                 )
-                if tick is not None:
-                    self._handle_data(tick)
-                    if pending_traces is not None:
-                        pending_traces.append((tick, "quote", tick_data))
-            if instrument_id in self._push_depth_ids:
-                depth = parse_full_tick_as_order_book_depth10(
-                    instrument_id=instrument_id,
-                    payload=tick_data,
-                    ts_init=ts_init,
-                )
-                if depth is not None:
-                    self._handle_data(depth)
-                    if pending_traces is not None:
-                        pending_traces.append((depth, "depth10", tick_data))
         # Finish normal delivery for the entire batch before diagnostic handlers
         # run. Disabled tracing allocates neither events nor a pending list.
         self._publish_tick_traces(pending_traces)
+
+    def _deliver_full_tick(
+        self,
+        code: object,
+        instrument_id: InstrumentId,
+        tick_data: dict,
+        ts_init: int,
+        data_kind: str,
+        pending_traces: list | None,
+    ) -> None:
+        stage = "parse"
+        try:
+            if data_kind == "quote":
+                market_data = parse_full_tick_as_quote_tick(instrument_id, tick_data, ts_init)
+            else:
+                diagnostics: list[str] = []
+                market_data = parse_full_tick_as_order_book_depth10(
+                    instrument_id, tick_data, ts_init, diagnostics=diagnostics,
+                )
+                for reason in diagnostics:
+                    self._report_push_issue(code, data_kind, "parse", reason)
+            if market_data is None:
+                return
+            stage = "deliver"
+            self._handle_data(market_data)
+            if pending_traces is not None:
+                pending_traces.append((market_data, data_kind, tick_data))
+        except Exception as exc:
+            self._report_push_issue(code, data_kind, stage, f"{type(exc).__name__}:{exc}")
 
     def _publish_tick_traces(self, pending_traces: list | None) -> None:
         if pending_traces is None:
             return
         for market_data, data_kind, payload in pending_traces:
-            self._publish_tick_trace(market_data, data_kind, payload)
+            try:
+                self._publish_tick_trace(market_data, data_kind, payload)
+            except Exception as exc:
+                self._report_push_issue(
+                    market_data.instrument_id, data_kind, "trace", f"{type(exc).__name__}:{exc}",
+                )
 
     def _publish_tick_trace(self, market_data, data_kind: str, payload: dict) -> None:
         try:
@@ -629,10 +671,10 @@ class BigQMTDataClient(LiveMarketDataClient):
                 msg=event,
                 external_pub=False,
             )
-        except Exception:
-            # Diagnostics (including subscriber exceptions) must never abort
-            # market data processing. Do not emit per-tick failure logs here.
-            return
+        except Exception as exc:
+            self._report_push_issue(
+                market_data.instrument_id, data_kind, "trace", f"{type(exc).__name__}:{exc}",
+            )
 
     def _dataframe_to_bars(self, bar_type: BarType, symbol: str, data: dict) -> list:
         df = _lookup_symbol(data, symbol)
