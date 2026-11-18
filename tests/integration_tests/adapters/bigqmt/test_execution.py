@@ -19,12 +19,16 @@ from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_VENUE
 from nautilus_trader.adapters.bigqmt.execution import BigQMTExecutionClient
+from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import GenerateFillReports
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
+from nautilus_trader.live.execution_engine import LiveExecutionEngine
 from nautilus_trader.model.currencies import CNY
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
@@ -39,6 +43,8 @@ from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.orders.limit import LimitOrder
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 
 INSTRUMENT_ID = InstrumentId(symbol=Symbol("000001.SZ"), venue=BIG_QMT_VENUE)
@@ -192,14 +198,15 @@ def _test_order(client_order_id="O-1"):
     )
 
 
-def test_parse_order_status_report_maps_bigqmt_fields():
+@pytest.mark.parametrize("price_type", [11, 50, "50"])
+def test_parse_order_status_report_maps_bigqmt_fields(price_type):
     report = _StubExecClient()._parse_order_status_report(
         {
             "stock_code": "000001.SZ",
             "order_sysid": "7788",
             "order_remark": "O-1",
             "action": "SELL",
-            "price_type": 11,
+            "price_type": price_type,
             "order_volume": 100,
             "traded_volume": 0,
             "price": 12.34,
@@ -215,6 +222,58 @@ def test_parse_order_status_report_maps_bigqmt_fields():
     assert report.order_status == OrderStatus.ACCEPTED
     assert str(report.price) == "12.34"
     assert report.avg_px == Decimal(0)
+
+
+@pytest.mark.parametrize("price_type", [5, 49, "49"])
+def test_parse_order_status_report_preserves_market_type(price_type):
+    report = _StubExecClient()._parse_order_status_report(
+        {
+            "stock_code": "000001.SZ",
+            "order_sysid": "7788",
+            "order_remark": "O-1",
+            "action": "BUY",
+            "price_type": price_type,
+            "order_volume": 100,
+            "order_status": 50,
+        },
+    )
+
+    assert report is not None
+    assert report.order_type == OrderType.MARKET
+
+
+def test_reconciliation_restores_broker_limit_order_with_price():
+    report = _StubExecClient()._parse_order_status_report(
+        {
+            "stock_code": "000001.SZ",
+            "order_sysid": "7788",
+            "order_remark": "O-1",
+            "action": "BUY",
+            "price_type": 50,  # EBrokerPriceType limit, not passorder FIX_PRICE=11.
+            "order_volume": 1000,
+            "traded_volume": 0,
+            "price": 16.36,
+            "order_status": 50,
+        },
+    )
+    loop = asyncio.new_event_loop()
+    engine = LiveExecutionEngine(
+        loop=loop,
+        msgbus=TestComponentStubs.msgbus(),
+        cache=TestComponentStubs.cache(),
+        clock=TestComponentStubs.clock(),
+        config=LiveExecEngineConfig(filter_unclaimed_external_orders=False),
+    )
+    try:
+        order = engine._generate_order(report)
+
+        assert isinstance(order, LimitOrder)
+        assert order.price == Price.from_str("16.36")
+        assert order.client_order_id == ClientOrderId("O-1")
+        assert order.quantity == Quantity.from_int(1000)
+    finally:
+        engine.dispose()
+        loop.close()
 
 
 def test_parse_order_status_report_defaults_missing_price_type_to_limit():

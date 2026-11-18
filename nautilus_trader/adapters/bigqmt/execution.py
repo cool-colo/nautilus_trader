@@ -21,12 +21,12 @@ from typing import Any
 
 from nautilus_trader.adapters.bigqmt.client import BigQMTClient
 from nautilus_trader.adapters.bigqmt.common import bigqmt_action_to_side
+from nautilus_trader.adapters.bigqmt.common import bigqmt_order_type_from_price_type
 from nautilus_trader.adapters.bigqmt.common import bigqmt_status_to_order_status
 from nautilus_trader.adapters.bigqmt.common import bigqmt_symbol_to_instrument_id
 from nautilus_trader.adapters.bigqmt.common import bigqmt_traded_at_to_nanos
 from nautilus_trader.adapters.bigqmt.common import instrument_id_to_bigqmt_symbol
 from nautilus_trader.adapters.bigqmt.common import millis_to_nanos
-from nautilus_trader.adapters.bigqmt.common import qmt_order_type_from_price_type
 from nautilus_trader.adapters.bigqmt.common import quantity_to_int
 from nautilus_trader.adapters.bigqmt.config import BigQMTExecClientConfig
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_ORDER_SIDE_BUY
@@ -884,7 +884,7 @@ class BigQMTExecutionClient(LiveExecutionClient):
             venue_order_id=VenueOrderId(venue_order_id_value),
             client_order_id=client_order_id,
             order_side=self._order_side(raw_order),
-            order_type=qmt_order_type_from_price_type(price_type),
+            order_type=bigqmt_order_type_from_price_type(price_type),
             time_in_force=TimeInForce.DAY,
             order_status=status,
             quantity=Quantity.from_int(order_volume),

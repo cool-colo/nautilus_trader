@@ -27,6 +27,7 @@ import math
 
 import pandas as pd
 
+from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_BROKER_PRICE_TYPE_LIMIT
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_ORDER_CANCELED
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_ORDER_JUNK
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_ORDER_PART_CANCEL
@@ -66,6 +67,7 @@ from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.instruments import Equity
@@ -78,6 +80,7 @@ __all__ = [
     "SHANGHAI_TZ",
     "bar_type_to_qmt_period",
     "bigqmt_action_to_side",
+    "bigqmt_order_type_from_price_type",
     "bigqmt_status_to_order_status",
     "bigqmt_symbol_to_instrument_id",
     "bigqmt_traded_at_to_nanos",
@@ -100,6 +103,19 @@ __all__ = [
     "quantity_to_int",
     "timestamp_to_qmt_str",
 ]
+
+
+def bigqmt_order_type_from_price_type(price_type: int) -> OrderType:
+    """Parse order-report price types, including native EBrokerPriceType.
+
+    Big QMT reports m_nOrderPriceType=50 for a limit order, whereas
+    passorder and xtquant use FIX_PRICE=11. The bridge exposes the native
+    value unchanged; treating it as a passorder price type creates a
+    MarketOrder during reconciliation and loses the order's limit price.
+    """
+    if int(price_type) == BIG_QMT_BROKER_PRICE_TYPE_LIMIT:
+        return OrderType.LIMIT
+    return qmt_order_type_from_price_type(price_type)
 
 
 def bigqmt_symbol_to_instrument_id(symbol: str) -> InstrumentId:

@@ -21,6 +21,9 @@ BIG_QMT_VENUE = Venue("BIGQMT")
 BIG_QMT_PRICE_TYPE_LATEST_PRICE = 5
 BIG_QMT_PRICE_TYPE_FIX_PRICE = 11
 
+# EBrokerPriceType on order reports differs from passorder's price type.
+BIG_QMT_BROKER_PRICE_TYPE_LIMIT = 50
+
 BIG_QMT_ORDER_SIDE_BUY = 23
 BIG_QMT_ORDER_SIDE_SELL = 24
 
