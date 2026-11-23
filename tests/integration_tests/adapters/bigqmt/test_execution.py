@@ -19,7 +19,11 @@ from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
+from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_PRICE_TYPE_FIX_PRICE
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_VENUE
+from nautilus_trader.adapters.bigqmt.enums import EBrokerPriceType
 from nautilus_trader.adapters.bigqmt.execution import BigQMTExecutionClient
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import GenerateFillReports
@@ -192,14 +196,15 @@ def _test_order(client_order_id="O-1"):
     )
 
 
-def test_parse_order_status_report_maps_bigqmt_fields():
+@pytest.mark.parametrize("price_type", [BIG_QMT_PRICE_TYPE_FIX_PRICE, EBrokerPriceType.LIMIT.value])
+def test_parse_order_status_report_maps_bigqmt_fields(price_type):
     report = _StubExecClient()._parse_order_status_report(
         {
             "stock_code": "000001.SZ",
             "order_sysid": "7788",
             "order_remark": "O-1",
             "action": "SELL",
-            "price_type": 11,
+            "price_type": price_type,
             "order_volume": 100,
             "traded_volume": 0,
             "price": 12.34,
@@ -215,6 +220,26 @@ def test_parse_order_status_report_maps_bigqmt_fields():
     assert report.order_status == OrderStatus.ACCEPTED
     assert str(report.price) == "12.34"
     assert report.avg_px == Decimal(0)
+
+
+def test_parse_order_status_report_maps_broker_market_price_type():
+    report = _StubExecClient()._parse_order_status_report(
+        {
+            "stock_code": "000001.SZ",
+            "order_sysid": "7788",
+            "order_remark": "O-1",
+            "action": "BUY",
+            "price_type": EBrokerPriceType.MARKET.value,
+            "order_volume": 100,
+            "traded_volume": 0,
+            "price": 0,
+            "order_status": 50,
+        },
+    )
+
+    assert report is not None
+    assert report.order_type == OrderType.MARKET
+    assert report.price is None
 
 
 def test_parse_order_status_report_defaults_missing_price_type_to_limit():

@@ -32,6 +32,7 @@ from nautilus_trader.adapters.bigqmt.config import BigQMTExecClientConfig
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_ORDER_SIDE_BUY
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_ORDER_SIDE_SELL
 from nautilus_trader.adapters.bigqmt.constants import BIG_QMT_VENUE
+from nautilus_trader.adapters.bigqmt.enums import EBrokerPriceType
 from nautilus_trader.adapters.bigqmt.providers import BigQMTInstrumentProvider
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
@@ -884,7 +885,11 @@ class BigQMTExecutionClient(LiveExecutionClient):
             venue_order_id=VenueOrderId(venue_order_id_value),
             client_order_id=client_order_id,
             order_side=self._order_side(raw_order),
-            order_type=qmt_order_type_from_price_type(price_type),
+            order_type=(
+                OrderType.LIMIT
+                if price_type == EBrokerPriceType.LIMIT
+                else qmt_order_type_from_price_type(price_type)
+            ),
             time_in_force=TimeInForce.DAY,
             order_status=status,
             quantity=Quantity.from_int(order_volume),
